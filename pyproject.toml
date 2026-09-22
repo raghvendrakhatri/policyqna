@@ -1,0 +1,10 @@
+[project]
+name = "policyqa"
+version = "0.1.0"
+description = "Local RAG system over policy documents"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "psycopg[binary]>=3.2",
+    "python-dotenv>=1.0",
+]
