@@ -247,3 +247,56 @@ def test_all_zero_ignores_booleans():
     assert not rag.all_zero({"name": "X", "is_paid": False, "is_active": False})
     assert rag.all_zero({"name": "X", "balance": 0, "used": 0.0})
     assert not rag.all_zero({"name": "X"})
+
+
+# ----------------------------------------------------------------- attribution
+
+
+def provenance(profile="", knowledge=None, docs=()):
+    from langchain_core.documents import Document
+    p = rag.Provenance()
+    p.profile = profile
+    p.knowledge = knowledge or {}
+    p.docs = [Document(page_content=text, metadata=meta) for text, meta in docs]
+    return p
+
+
+def test_an_answer_about_the_person_is_credited_to_the_hrms():
+    """It used to be credited to whichever policy page came back alongside."""
+    source = provenance(
+        profile="- full name: Raghvendra Khatri\n- position level: SR1",
+        docs=[("Bronze 750 Silver 1200 Gold 1500 travel allowance table",
+               {"source": "perks-and-benefits.md"})])
+    assert rag.credit("You are Raghvendra Khatri, SR1.", source) == "the HRMS"
+
+
+def test_a_figure_from_the_profile_beats_a_wordier_file():
+    """A terse profile line used to lose to any file that discussed leave."""
+    source = provenance(
+        profile="- balance days: 13.0\n- total allocated days: 30.0",
+        knowledge={"knowledge/sources-of-truth.md":
+                   "The handbook is authoritative for entitlement, the profile "
+                   "for days already used and days left as of the profile date."})
+    assert rag.credit("You have 13.0 WFH days left, as of the profile date.",
+                      source) == "the HRMS"
+
+
+def test_a_policy_answer_is_credited_to_its_pages():
+    source = provenance(docs=[
+        ("The notice period shall be 3 months for all confirmed employees.",
+         {"source": "policy.pdf", "page": 83}),
+        ("Unrelated text about reimbursement invoices and GST.",
+         {"source": "policy.pdf", "page": 12})])
+    assert rag.credit("The notice period is 3 months.", source) == "policy.pdf p. 83"
+
+
+def test_two_chunks_from_one_page_are_named_once():
+    source = provenance(docs=[
+        ("notice period 3 months clause one", {"source": "policy.pdf", "page": 83}),
+        ("notice period 3 months clause two", {"source": "policy.pdf", "page": 83})])
+    assert rag.credit("The notice period is 3 months.", source) == "policy.pdf p. 83"
+
+
+def test_nothing_overlapping_is_credited_to_nothing():
+    source = provenance(docs=[("wholly unrelated wording", {"source": "policy.pdf"})])
+    assert rag.credit("qqqq zzzz", source) == ""

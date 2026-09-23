@@ -12,6 +12,7 @@ dependencies = [
     "langchain-ollama>=0.3",
     "langchain-postgres>=0.0.14",
     "langchain-text-splitters>=0.3",
+    "rich>=13.9",
 ]
 
 [project.optional-dependencies]
