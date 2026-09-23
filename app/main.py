@@ -1,8 +1,14 @@
+"""Health check: can we reach Postgres and Ollama? The app itself is rag.py."""
+
 import os
 import sys
+import urllib.error
+import urllib.request
 
 import psycopg
 from dotenv import load_dotenv
+
+import rag
 
 
 def ping_database() -> str:
@@ -19,14 +25,17 @@ def ping_database() -> str:
             return cur.fetchone()[0]
 
 
+def ping_ollama(base_url: str) -> list[str]:
+    with urllib.request.urlopen(f"{base_url}/api/tags", timeout=5) as response:
+        import json
+
+        return [m["name"] for m in json.load(response).get("models", [])]
+
+
 def main():
     load_dotenv()
 
-    missing = [
-        name
-        for name in ("POSTGRES_DB", "POSTGRES_USER", "POSTGRES_PASSWORD", "POSTGRES_PORT")
-        if not os.getenv(name)
-    ]
+    missing = [name for name in rag.REQUIRED_ENV if not os.getenv(name)]
     if missing:
         print(
             f"Missing env vars: {', '.join(missing)}. Copy .env.example to .env.",
@@ -39,8 +48,21 @@ def main():
     except psycopg.Error as exc:
         print(f"Database ping failed: {exc}", file=sys.stderr)
         return 1
-
     print(f"Database OK: {version}")
+
+    base_url = os.getenv("OLLAMA_BASE_URL")
+    try:
+        models = ping_ollama(base_url)
+    except (urllib.error.URLError, OSError) as exc:
+        print(f"Ollama ping failed at {base_url}: {exc}", file=sys.stderr)
+        return 1
+    print(f"Ollama OK at {base_url}: {len(models)} model(s) available")
+
+    for var in ("CHAT_MODEL", "EMBED_MODEL"):
+        name = os.getenv(var)
+        if name and name not in models:
+            print(f"Warning: {var}={name} is not pulled. `ollama pull {name}`", file=sys.stderr)
+
     return 0
 
 
