@@ -216,3 +216,6 @@ __marimo__/
 
 # Streamlit
 .streamlit/secrets.toml
+
+# Employee profiles fetched from the HRMS. Never commit real employee data.
+profiles/
