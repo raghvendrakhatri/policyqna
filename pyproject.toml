@@ -7,4 +7,7 @@ requires-python = ">=3.12"
 dependencies = [
     "psycopg[binary]>=3.2",
     "python-dotenv>=1.0",
+    "openai>=1.60",
+    "boto3>=1.40",
+    "pypdf>=5.1",
 ]
