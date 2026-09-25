@@ -1,0 +1,56 @@
+# Answers verified by hand against the indexed documents. Each one is a question
+# that was got wrong at some point, so these are regressions, not decoration.
+#
+#   expect  - all of these must appear in the answer
+#   reject  - none of these may appear
+#
+# Run with:  uv run --dev pytest tests/test_retrieval.py -v
+# Needs Ollama and Postgres up, and both documents ingested.
+
+- question: what is the daily food allowance for a Gold band employee in a tier 1 city?
+  expect: ["1,900"]
+  reject: ["1,600"]          # Silver's figure; a wide table made the model read across
+  why: the band x city-tier lookup, which failed until the table was split out
+
+- question: what is the daily food allowance for Silver band in a tier 3 city?
+  expect: ["750"]
+  why: the other end of the same table
+
+- question: do Bronze employees get a quarterly team lunch allowance?
+  reject: ["400", "500"]     # the Gold and Platinum figures: Bronze gets neither
+  why: a "no" that has to come from the table rather than from silence
+
+- question: what do I get for Employee of the Quarter and how many people win it?
+  expect: ["headphones", "4"]
+  why: the floater awards table, and a compound question
+
+- question: how many WFH days does a Platinum employee get, and do they carry forward?
+  expect: ["42"]
+  why: composes the perks table with the handbook's carry-forward rule
+
+- question: what is the PA rate for Sr2?
+  expect: ["8"]
+  why: needs the glossary's Sr2 -> Gold mapping, which retrieval alone cannot supply
+
+- question: what educational fund does a Sr1 get?
+  expect: ["75,000"]
+  why: same mapping, different row
+
+- question: what is the notice period?
+  expect: ["3 months"]
+  why: a plain handbook lookup
+
+- question: which tier is Indore, and which tier is Mumbai?
+  expect: ["tier 2", "tier 1"]
+  why: |
+    Annexure B classifies cities, but its headings are on page 64 and the lists
+    on page 65, so the columns arrive without their labels. The mapping lives in
+    the glossary for that reason.
+
+- question: how many sick leaves do I get in a fiscal year?
+  expect: ["3"]
+  why: |
+    The HRMS returns this leave type as allocated 0 / used 0, which is missing
+    configuration rather than an entitlement of zero. Such records are dropped
+    from the profile so the handbook answers.
+

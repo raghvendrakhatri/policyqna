@@ -7,7 +7,8 @@ COPY pyproject.toml uv.lock ./
 RUN uv sync --frozen --no-install-project
 
 COPY app ./app
+COPY knowledge ./knowledge
 
 RUN uv sync --frozen
 
-CMD ["uv", "run", "python", "app/main.py"]
+CMD ["uv", "run", "python", "app/rag.py", "stats"]
