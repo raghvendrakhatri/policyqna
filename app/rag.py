@@ -21,11 +21,15 @@ import json
 import os
 import re
 import sys
-import threading
-import time
 
 import psycopg
 from dotenv import load_dotenv
+from rich.console import Console
+from rich.markdown import Markdown
+from rich.panel import Panel
+from rich.table import Table
+from rich.text import Text
+from rich import box
 from langchain_core.documents import Document
 from langchain_core.output_parsers import StrOutputParser
 from langchain_core.prompts import ChatPromptTemplate
@@ -37,6 +41,11 @@ from pypdf import PdfReader
 from sqlalchemy import create_engine, text
 
 load_dotenv()
+
+# One Console per stream. Rich auto-disables colours and boxes when the stream
+# is piped, so scripts that consume the output keep working unchanged.
+console = Console()
+err_console = Console(stderr=True)
 
 # Every one of these must be set; see .env.example. main() checks them up front,
 # so env() below is only a backstop for an import-time or library-side read.
@@ -200,6 +209,13 @@ profile is the answer, not the policy's general rule. Asked what they have left,
 give their remaining balance, not the yearly allocation everyone gets. Their
 figures are as of the date in the profile, so say so when quoting one.
 
+But if the profile has no specific figure for what they asked, do NOT refuse.
+Fall back to the general policy in the context above and apply it to them -
+picking their band's row, their city tier's row, or noting that the policy is
+the same for everyone. The question is answered from the profile when it can
+be, and from the general policy otherwise; "not defined for you specifically"
+is never the answer when the policy applies to everyone.
+
 The exception is where the reference facts above say which source wins. Follow
 that, and follow it over this paragraph.
 
@@ -222,6 +238,9 @@ CONTEXTUALIZE_PROMPT = """Rewrite the follow-up question so that it stands alone
   "what about" or "for X?" never stands alone - name in full the thing it asks
   about, even when that means repeating the previous question almost verbatim.
 - Keep the user's own wording for whatever they did say.
+- Do NOT add the asker's identity, name, role, band, city tier or any other
+  personal detail. Those are applied downstream when the answer is composed.
+  A rewrite is about the topic, never about who is asking.
 - Output the rewritten question and nothing else.
 
 Example
@@ -259,6 +278,107 @@ COMPOUND = re.compile(r"\band\b|\s&\s|;", re.I)
 
 def looks_compound(question: str) -> bool:
     return bool(COMPOUND.search(question)) or question.count("?") > 1
+
+
+# A question that opens with one of these needs the previous turn to make sense:
+# "and for Gold?", "what about tier 3?". Anything else already stands alone -
+# rewriting it just gives the LLM a chance to inject the user's identity into
+# what should be a topical query.
+FOLLOWUP_OPENERS = re.compile(
+    r"^\s*(and|but|also|what about|how about|and (for|in|about)|for|in|"
+    r"can (i|you|it|they)|do (i|they|you|we)|does (it|he|she|that)|is (it|that)|"
+    r"why|then|so)\b",
+    re.I,
+)
+
+
+def looks_like_followup(question: str) -> bool:
+    """True when the question genuinely refers back to the previous turn.
+
+    A short question, or one opening with a linking word, still needs the
+    conversation to make sense. A longer question that already names its topic
+    ("what is the reimbursement policy") stands alone and must not be rewritten.
+    """
+    stripped = question.strip()
+    if len(stripped.split()) <= 3:
+        return True
+    return bool(FOLLOWUP_OPENERS.match(stripped))
+
+# ----------------------------------------------------------------- guardrails
+
+# Prompt-injection patterns. A user question should never try to reset the
+# system prompt or exfiltrate it; anything matching is refused before it
+# reaches retrieval, so a poisoned question cannot leak the profile either.
+INJECTION = re.compile(
+    r"ignore (all |the |any )?(previous|above|prior|earlier) (instructions|prompt|rules|context)"
+    r"|disregard (the |all )?(system|previous|above)"
+    r"|you are now\b|act as (a |an )?\w+"
+    r"|forget (everything|all|your) (you|prior|previous|instructions)"
+    r"|reveal (the |your )?(system prompt|instructions|prompt)"
+    r"|print (the |your )?(system prompt|instructions)",
+    re.I,
+)
+MAX_QUESTION_CHARS = 2000
+REFUSAL = "I can only answer questions about the indexed policy documents."
+UNSAFE_REFUSAL = "That request was flagged as unsafe and won't be answered."
+UNSAFE_OUTPUT = "The generated answer was flagged as unsafe and has been suppressed."
+
+# Optional LlamaGuard-style safety classifier served by the same Ollama instance.
+# Set SAFETY_MODEL=llama-guard3:1b in .env to enable; unset to skip. The 1B
+# variant is small enough to run per call without evicting the chat model.
+_safety_llm: "ChatOllama | None" = None
+
+
+def safety_llm() -> "ChatOllama | None":
+    global _safety_llm
+    name = os.getenv("SAFETY_MODEL")
+    if not name:
+        return None
+    if _safety_llm is None:
+        _safety_llm = ChatOllama(
+            model=name,
+            base_url=env("OLLAMA_BASE_URL"),
+            temperature=0,
+            keep_alive=KEEP_ALIVE,
+        )
+    return _safety_llm
+
+
+def check_safety(text: str, role: str) -> str | None:
+    """None when safe (or classifier disabled), else the unsafe categories.
+
+    LlamaGuard replies "safe" or "unsafe\\nS1,S3,..." where the S-codes name
+    Meta's harm categories. `role` picks which side is being evaluated: "human"
+    for input, "ai" for output - the same message text scores differently.
+    """
+    model = safety_llm()
+    if model is None or not text.strip():
+        return None
+    try:
+        verdict = model.invoke([(role, text)]).content.strip().lower()
+    except Exception as exc:  # noqa: BLE001 - a classifier failure must not block answers
+        print(f"Safety check skipped: {exc}", file=sys.stderr)
+        return None
+    if verdict.startswith("safe"):
+        return None
+    lines = verdict.splitlines()
+    return lines[1].strip() if len(lines) > 1 else "unsafe"
+
+
+def guard_input(question: str) -> str | None:
+    """Refusal message when the question should not reach the model, else None."""
+    if not question.strip():
+        return "Please ask a question."
+    if len(question) > MAX_QUESTION_CHARS:
+        return f"Question is too long ({len(question)} chars). Please shorten it."
+    if INJECTION.search(question):
+        return REFUSAL
+    unsafe = check_safety(question, "human")
+    if unsafe:
+        print(f"Input flagged unsafe: {unsafe}", file=sys.stderr)
+        return UNSAFE_REFUSAL
+    return None
+
 
 # CHAT_MODEL is a non-thinking instruct model, so nothing should reach these.
 # They are the backstop for a thinking model: note that on such a model
@@ -398,14 +518,20 @@ def knowledge_files() -> list[str]:
     )
 
 
-def load_knowledge() -> str:
-    """Every knowledge file, concatenated and headed by its filename."""
-    parts = []
+def read_knowledge() -> dict[str, str]:
+    """Each knowledge file by name, so an answer can be credited to one."""
+    found = {}
     for path in knowledge_files():
         with open(path, encoding="utf-8") as fh:
             text = fh.read().strip()
         if text:
-            parts.append(f"[{os.path.basename(path)}]\n{text}")
+            found[f"knowledge/{os.path.basename(path)}"] = text
+    return found
+
+
+def load_knowledge() -> str:
+    """Every knowledge file, concatenated and headed by its filename."""
+    parts = [f"[{os.path.basename(name)}]\n{text}" for name, text in read_knowledge().items()]
     joined = "\n\n".join(parts)
     if len(joined) > KNOWLEDGE_WARN_CHARS:
         print(
@@ -809,69 +935,30 @@ def cmd_ingest(path: str, replace: bool) -> int:
 # ---------------------------------------------------------------------- waiting
 
 
-SPINNER_FRAMES = "|/-\\"
-SPINNER_INTERVAL = 0.12
-# Whatever is spinning right now, so a progress note can retitle it instead of
-# printing over the top of it.
-_SPINNER: "Spinner | None" = None
-
-
-class Spinner:
-    """A frame, a label and the seconds so far, on one rewritten line.
-
-    Everything here runs locally, so a question can sit for a minute while
-    Ollama loads a model. Without this the terminal looks hung.
-    """
-
-    def __init__(self, label: str):
-        self.label = label
-        self._stop = threading.Event()
-        self._thread = threading.Thread(target=self._spin, daemon=True)
-        self._width = 0
-
-    def _spin(self) -> None:
-        start = time.monotonic()
-        for tick in range(sys.maxsize):
-            if self._stop.wait(SPINNER_INTERVAL):
-                break
-            frame = SPINNER_FRAMES[tick % len(SPINNER_FRAMES)]
-            line = f"{frame} {self.label}... {time.monotonic() - start:.0f}s"
-            self._width = max(self._width, len(line))
-            sys.stderr.write("\r" + line.ljust(self._width))
-            sys.stderr.flush()
-        sys.stderr.write("\r" + " " * self._width + "\r")
-        sys.stderr.flush()
-
-    def __enter__(self) -> "Spinner":
-        global _SPINNER
-        _SPINNER = self
-        self._thread.start()
-        return self
-
-    def __exit__(self, *_exc) -> None:
-        global _SPINNER
-        self._stop.set()
-        self._thread.join(timeout=1)
-        _SPINNER = None
+# Rich's Status handles the spinner frames, elapsed time and line rewriting.
+# We keep the retitle-on-status trick by holding the live handle here so a
+# progress note can update its label instead of printing over the top of it.
+_STATUS = None
 
 
 @contextlib.contextmanager
 def waiting(label: str):
-    """No spinner when stderr is redirected: it would only litter the file."""
-    if not sys.stderr.isatty():
-        yield
-        return
-    with Spinner(label):
-        yield
+    """A rich spinner on stderr. Rich no-ops on non-TTY, so a piped run stays clean."""
+    global _STATUS
+    with err_console.status(f"[cyan]{label}[/cyan]", spinner="dots") as handle:
+        _STATUS = handle
+        try:
+            yield
+        finally:
+            _STATUS = None
 
 
 def status(message: str) -> None:
-    """A progress note. Retitles the spinner if one is running, so the two do
-    not fight over the same line."""
-    if _SPINNER is not None:
-        _SPINNER.label = message
+    """Progress note. Retitles the active spinner if one is running."""
+    if _STATUS is not None:
+        _STATUS.update(f"[cyan]{message}[/cyan]")
     else:
-        print(message, file=sys.stderr)
+        err_console.print(f"[dim]{message}[/dim]")
 
 
 def format_docs(docs: list[Document]) -> str:
@@ -882,10 +969,10 @@ def clean(text: str) -> str:
     return STRAY_CLOSE.sub("", REASONING.sub("", text)).strip()
 
 
-def build_chain(k: int, profile: str = "", retrieved: list | None = None):
-    """`retrieved`, if given, is refilled with the chunks used by each question,
-    so the caller can cite them. Taken from the chunks themselves rather than
-    asked of the model, which would sooner or later invent a page number."""
+def build_chain(k: int, profile: str = "", provenance: "Provenance | None" = None):
+    """`provenance`, if given, records what each answer could have drawn on, so
+    the caller can credit it. Built from the texts rather than asked of the
+    model, which would sooner or later invent a page number."""
     model = llm()  # one model object, so both calls hit the same loaded weights
     vectors = store()
 
@@ -895,6 +982,9 @@ def build_chain(k: int, profile: str = "", retrieved: list | None = None):
         | StrOutputParser()
     )
     knowledge = load_knowledge()
+    if provenance is not None:
+        provenance.profile = profile
+        provenance.knowledge = read_knowledge()
     system = SYSTEM_PROMPT + (KNOWLEDGE_PROMPT if knowledge else "")
     system += PROFILE_PROMPT if profile else ""
     answer_prompt = ChatPromptTemplate.from_messages(
@@ -934,9 +1024,13 @@ def build_chain(k: int, profile: str = "", retrieved: list | None = None):
                 if doc.id not in seen:
                     seen.add(doc.id)
                     docs.append(doc)
-        if retrieved is not None:
-            retrieved.clear()  # this question's chunks, not the last one's
-            retrieved.extend(docs)
+        if provenance is not None:
+            provenance.docs = docs  # this question's chunks, not the last one's
+        # Retrieval guardrail: if nothing came back, the model would hallucinate
+        # against an empty context. Raising here lets ask() print the refusal
+        # instead of asking the model to answer from thin air.
+        if not docs and not knowledge and not profile:
+            raise NoContext()
         return docs
 
     return (
@@ -960,63 +1054,165 @@ def build_contextualizer():
 
 
 WORD = re.compile(r"[a-z]{4,}|\d[\d.]*")
-# Retrieval hands the model more than it uses, so citing everything retrieved
-# would credit pages the answer never drew on. Keep the chunks the answer
-# actually overlaps, and at most this many.
+# Retrieval hands the model more than it uses, and the profile and knowledge are
+# in every prompt whether they are relevant or not. So a source is credited only
+# where the answer's own wording overlaps it.
 CITE_MAX = 4
+CITE_SHARE = 0.6  # of the best-scoring source
+
+
+class Provenance:
+    """Everything the answer could have come from, so it can be credited.
+
+    Three layers reach the model - the HRMS profile, the knowledge files and the
+    retrieved chunks - and until this existed only the third was ever named. An
+    answer about who someone is would be credited to whichever policy page
+    happened to be retrieved alongside it.
+    """
+
+    def __init__(self) -> None:
+        self.profile = ""
+        self.knowledge: dict[str, str] = {}
+        self.docs: list[Document] = []
+
+    def candidates(self) -> list[tuple[str, str]]:
+        named: list[tuple[str, str]] = []
+        if self.profile:
+            # Score the profile per top-level block, not as one blob. A long
+            # profile has hundreds of unrelated words, so the sqrt-of-length
+            # denominator drowns the one "wfh: remaining 13.0" line that
+            # actually matched - and the HRMS never gets credited even when
+            # the answer's own figure came from it.
+            block: list[str] = []
+            for line in self.profile.splitlines():
+                # A top-level field starts flush left; a nested one is indented.
+                if line and not line[0].isspace() and block:
+                    named.append(("the HRMS", "\n".join(block)))
+                    block = []
+                block.append(line)
+            if block:
+                named.append(("the HRMS", "\n".join(block)))
+        named += list(self.knowledge.items())
+        return named + [(doc_label(d), d.page_content) for d in self.docs]
+
+
+def doc_label(doc: Document) -> str:
+    source = doc.metadata.get("source", "?")
+    page = doc.metadata.get("page")
+    return f"{source} p. {page}" if isinstance(page, int) else source
 
 
 def terms(text: str) -> set[str]:
     return set(WORD.findall(text.lower().replace(",", "")))
 
 
-def used_docs(answer: str, docs: list[Document]) -> list[Document]:
-    """The retrieved chunks the answer appears to have come from.
+def overlap(wanted: set[str], text: str) -> float:
+    """How much of the answer this source accounts for.
 
-    Scored by shared wording, which is a heuristic - but a citation naming a
-    page the answer never used is worse than a slightly short list.
+    Figures count for much more than words: an answer of "13.0 days left" shares
+    ordinary words with any file that discusses leave, but the 13.0 comes from
+    exactly one place. Divided by the source's own size, so a long file does not
+    out-score a terse one just by containing more words.
+    """
+    have = terms(text)
+    if not have:
+        return 0.0
+    common = wanted & have
+    figures = sum(1 for term in common if term[0].isdigit())
+    return (len(common) + 4 * figures) / len(have) ** 0.5
+
+
+def credit(answer: str, provenance: "Provenance") -> str:
+    """The sources whose wording the answer overlaps, best first.
+
+    A heuristic, but it is built from the text rather than asked of the model,
+    so it cannot cite a page that does not exist.
     """
     wanted = terms(answer)
-    if not wanted:
-        return docs[:CITE_MAX]
-    scored = [(len(wanted & terms(d.page_content)), d) for d in docs]
+    scored = [(overlap(wanted, text), label) for label, text in provenance.candidates()]
     best = max((score for score, _ in scored), default=0)
     if not best:
-        return docs[:CITE_MAX]
-    keep = [d for score, d in sorted(scored, key=lambda p: -p[0]) if score >= best * 0.6]
-    return keep[:CITE_MAX]
+        return ""
+    seen: set[str] = set()
+    keep: list[str] = []
+    for score, label in sorted(scored, key=lambda p: -p[0]):
+        if score < best * CITE_SHARE:
+            break
+        # Same source can score twice - the HRMS is split into blocks, a doc
+        # into pages. Dedup by label so one big source cannot fill CITE_MAX.
+        if label in seen:
+            continue
+        seen.add(label)
+        keep.append(label)
 
-
-def cite(docs: list[Document]) -> str:
-    """"policy.pdf pp. 44, 46 - perks-and-benefits.md". Pages come from the
-    chunk metadata, so a document with none (a Markdown file is one Document)
-    is named without them."""
-    pages: dict[str, set[int]] = {}
-    for doc in docs:
-        source = doc.metadata.get("source", "?")
-        page = doc.metadata.get("page")
-        pages.setdefault(source, set())
-        if isinstance(page, int):
-            pages[source].add(page)
+    # One entry per document, with its pages gathered: "policy.pdf pp. 44, 46".
+    pages: dict[str, list[str]] = {}
+    for label in keep[:CITE_MAX]:
+        name, _, page = label.partition(" p. ")
+        pages.setdefault(name, [])
+        if page and page not in pages[name]:  # two chunks can share a page
+            pages[name].append(page)
     parts = []
-    for source in sorted(pages):
-        numbers = sorted(pages[source])
+    for name, numbers in pages.items():
         if not numbers:
-            parts.append(source)
+            parts.append(name)
         elif len(numbers) == 1:
-            parts.append(f"{source} p. {numbers[0]}")
+            parts.append(f"{name} p. {numbers[0]}")
         else:
-            parts.append(f"{source} pp. {', '.join(str(n) for n in numbers)}")
+            parts.append(f"{name} pp. {', '.join(sorted(numbers, key=int))}")
     return " - ".join(parts)
 
 
-def ask(chain, question: str, retrieved: list | None = None) -> str:
-    with waiting("thinking"):
-        answer = chain.invoke(question)
+class NoContext(Exception):
+    """Raised from gather() when retrieval returns nothing usable."""
+
+
+def refusal_panel(message: str, title: str = "Refused") -> Panel:
+    return Panel(Text(message, style="bold red"), title=title, border_style="red",
+                 box=box.ROUNDED)
+
+
+def ask(chain, question: str, provenance: "Provenance | None" = None) -> str:
+    refusal = guard_input(question)
+    if refusal:
+        console.print()
+        console.print(refusal_panel(refusal))
+        console.print()
+        return refusal
+    try:
+        with waiting("thinking"):
+            answer = chain.invoke(question)
+    except NoContext:
+        console.print()
+        console.print(refusal_panel(REFUSAL, title="No matching policy"))
+        console.print()
+        return REFUSAL
     cleaned = clean(answer)
-    print("\n" + (cleaned or "(empty answer)") + "\n")
-    if retrieved and cleaned:
-        print(f"Sources: {cite(used_docs(cleaned, retrieved))}\n")
+    unsafe = check_safety(cleaned, "ai") if cleaned else None
+    if unsafe:
+        err_console.print(f"[red]Output flagged unsafe: {unsafe}[/red]")
+        console.print()
+        console.print(refusal_panel(UNSAFE_OUTPUT, title="Unsafe output"))
+        console.print()
+        return UNSAFE_OUTPUT
+    console.print()
+    if cleaned:
+        console.print(Panel(Markdown(cleaned), border_style="cyan", box=box.ROUNDED,
+                            title="Answer", title_align="left"))
+    else:
+        console.print(Panel(Text("(empty answer)", style="dim italic"),
+                            border_style="dim", box=box.ROUNDED))
+    console.print()
+    if provenance is not None and cleaned:
+        sources = credit(cleaned, provenance)
+        if sources:
+            console.print(f"[green]Sources[/green] [dim]·[/dim] {sources}\n")
+        else:
+            # Grounding guardrail: credit() couldn't tie the answer to any
+            # retrieved chunk, knowledge file or profile field. Say so rather
+            # than silently ship an unsourced answer.
+            err_console.print("[yellow]! answer could not be tied to any indexed"
+                              " source[/yellow]")
     return cleaned
 
 
@@ -1024,10 +1220,37 @@ def cmd_ask(question: str, k: int, token: str | None, profile_name: str | None,
             sources: bool) -> int:
     if not indexed():
         sys.exit("Nothing indexed yet - run `ingest` first.")
-    retrieved: list | None = [] if sources else None
-    chain = build_chain(k, profile_text(token, profile_name), retrieved)
-    ask(chain, question, retrieved)
+    provenance = Provenance() if sources else None
+    chain = build_chain(k, profile_text(token, profile_name), provenance)
+    ask(chain, question, provenance)
     return 0
+
+
+def chat_banner(profile: str, token: str | None, profile_name: str | None,
+                sources: bool, k: int) -> Panel:
+    """Header panel shown once at the top of a chat session."""
+    rows = [
+        ("chat", f"[cyan]{env('CHAT_MODEL')}[/cyan]"),
+        ("embed", f"[cyan]{env('EMBED_MODEL')}[/cyan]"),
+    ]
+    safety = os.getenv("SAFETY_MODEL")
+    rows.append(("safety", f"[cyan]{safety}[/cyan]" if safety else "[dim]off[/dim]"))
+    if profile and token:
+        rows.append(("profile", "[green]live from HRMS[/green]"))
+    elif profile:
+        rows.append(("profile", f"[green]{profile_name} (offline)[/green]"))
+    else:
+        rows.append(("profile", "[dim]none — generic answers[/dim]"))
+    rows.append(("sources", "[green]on[/green]" if sources else "[dim]off[/dim]"))
+    rows.append(("k", f"[cyan]{k}[/cyan] chunks per question"))
+    body = Text()
+    for label, value in rows:
+        body.append(f"  {label:<8} ", style="dim")
+        body.append_text(Text.from_markup(value))
+        body.append("\n")
+    body.append("\n  Ctrl-C or empty line to quit.", style="dim italic")
+    return Panel(body, title="[bold]policyqa · chat[/bold]",
+                 title_align="left", border_style="magenta", box=box.ROUNDED)
 
 
 def cmd_chat(k: int, token: str | None, profile_name: str | None, sources: bool) -> int:
@@ -1036,26 +1259,29 @@ def cmd_chat(k: int, token: str | None, profile_name: str | None, sources: bool)
     # Fetched once per session, not per question: a chat would otherwise hammer
     # the HRMS, and the balances should not shift underneath a conversation.
     profile = profile_text(token, profile_name)
-    retrieved: list | None = [] if sources else None
-    chain = build_chain(k, profile, retrieved)  # built once, so one warm-up
+    provenance = Provenance() if sources else None
+    chain = build_chain(k, profile, provenance)  # built once, so one warm-up
     contextualize = build_contextualizer()
     history: list[tuple[str, str]] = []
 
-    if profile:
-        print("Answering for the employee the HRMS returned." if token
-              else f"Answering from the saved profile '{profile_name}'.")
-    print("Ask about the indexed policies. Ctrl-C or empty line to quit.")
+    console.print()
+    console.print(chat_banner(profile, token, profile_name, sources, k))
+
     while True:
         try:
-            question = input("\n> ").strip()
+            console.print()
+            question = console.input("[bold cyan]❯[/bold cyan] ").strip()
         except (EOFError, KeyboardInterrupt):
-            print()
+            console.print()
             return 0
         if not question:
             return 0
 
         standalone = question
-        if history:
+        # Only rewrite when the question actually refers back. A standalone
+        # question ("what is the reimbursement policy") already names its topic
+        # and the rewriter would only pollute it with the asker's identity.
+        if history and looks_like_followup(question):
             recent = "\n".join(
                 f"Q: {q}\nA: {a}" for q, a in history[-HISTORY_TURNS:]
             )
@@ -1065,9 +1291,9 @@ def cmd_chat(k: int, token: str | None, profile_name: str | None, sources: bool)
                 )
             standalone = clean(rewritten).strip() or question
             if standalone != question:
-                print(f"(reading that as: {standalone})", file=sys.stderr)
+                err_console.print(f"[dim italic]· reading that as: {standalone}[/dim italic]")
 
-        answer = ask(chain, standalone, retrieved)
+        answer = ask(chain, standalone, provenance)
         history.append((standalone, answer))
 
 
@@ -1092,16 +1318,31 @@ def indexed() -> bool:
 def cmd_stats() -> int:
     rows = counts_by_source()
     if rows is None:
-        print("No index yet - run `ingest` first.")
+        console.print("[yellow]No index yet — run `ingest` first.[/yellow]")
         return 0
-    print("Index is empty." if not rows else "")
-    for source, count in rows:
-        print(f"{source:<40} {count:>6} chunks")
+    if not rows:
+        console.print("[dim]Index is empty.[/dim]")
+    else:
+        table = Table(title="Indexed documents", box=box.SIMPLE_HEAVY,
+                      title_style="bold", header_style="bold cyan")
+        table.add_column("Source")
+        table.add_column("Chunks", justify="right", style="green")
+        for source, count in rows:
+            table.add_row(source, f"{count}")
+        console.print(table)
     files = knowledge_files()
     if files:
-        print(f"\nknowledge/ (sent with every question, {len(load_knowledge())} chars):")
+        total = len(load_knowledge())
+        ktable = Table(
+            title=f"knowledge/ · sent with every question · {total} chars total",
+            box=box.SIMPLE, title_style="bold", header_style="bold cyan",
+        )
+        ktable.add_column("File")
+        ktable.add_column("Size", justify="right", style="green")
         for path in files:
-            print(f"  {os.path.basename(path)}")
+            ktable.add_row(os.path.basename(path), f"{os.path.getsize(path)} B")
+        console.print()
+        console.print(ktable)
     return 0
 
 
@@ -1123,13 +1364,20 @@ def cmd_discover() -> int:
         sys.exit("Set HRMS_LOGIN_URL (or HRMS_BASE_URL) in .env first.")
     rows = hrms_login.discover(login_url, api_hint=os.getenv("HRMS_API_HINT", ""))
     if not rows:
-        print("\nNo JSON API calls seen. Is HRMS_API_HINT too narrow?")
+        console.print("[yellow]No JSON API calls seen. Is HRMS_API_HINT too narrow?[/yellow]")
         return 0
-    print(f"\n{len(rows)} endpoint(s) seen:\n")
-    for method, url, status, keys in rows:
-        print(f"{method} {status}  {url}\n    keys: {keys}\n")
-    print("Pick the one holding band, city tier and balances, then set")
-    print("HRMS_BASE_URL and HRMS_PROFILE_PATH in .env to its two halves.")
+    table = Table(title=f"{len(rows)} endpoint(s) seen", box=box.SIMPLE_HEAVY,
+                  title_style="bold", header_style="bold cyan")
+    table.add_column("Method", style="magenta")
+    table.add_column("Status", justify="right")
+    table.add_column("URL")
+    table.add_column("Top-level keys", style="dim")
+    for method, url, status_code, keys in rows:
+        table.add_row(method, str(status_code), url, keys)
+    console.print()
+    console.print(table)
+    console.print("[dim]Pick the one holding band, city tier and balances,"
+                  " then set HRMS_BASE_URL and HRMS_PROFILE_SOURCES.[/dim]")
     return 0
 
 
@@ -1174,14 +1422,30 @@ def cmd_pa(path: str) -> int:
     except (KeyError, TypeError) as exc:
         sys.exit(f"{path} needs client_weight, team_weight and criteria: {exc}")
 
-    print(f"\nclient weight {data['client_weight']}, team weight {data['team_weight']}\n")
+    console.print()
+    console.print(f"[dim]client weight[/dim] {data['client_weight']}   "
+                  f"[dim]team weight[/dim] {data['team_weight']}")
+    table = Table(box=box.SIMPLE, header_style="bold cyan")
+    table.add_column("Criterion")
+    table.add_column("Feedback")
+    table.add_column("Score", justify="right")
+    table.add_column("Weight", justify="right")
+    table.add_column("Weighted", justify="right", style="green")
     for row in result["criteria"]:
-        sources = "+".join(row["sources"]) or "no feedback"
-        print(f"  {row['name']:<24} {sources:<14} score {row['score']:.4g}"
-              f" x weight {row['weight']} = {row['weighted']:.4g}")
-    print(f"\n  sum of weightedPa = {result['total']:.4g}")
-    print(f"  finalScore = ({result['total']:.4g} / {PA_SCALE}) x 100 ="
-          f" {result['final_score']:.4g}\n")
+        sources = "+".join(row["sources"]) or "[dim]no feedback[/dim]"
+        table.add_row(row["name"], sources, f"{row['score']:.4g}",
+                      f"{row['weight']}", f"{row['weighted']:.4g}")
+    console.print(table)
+    console.print(
+        f"[dim]  sum of weightedPa =[/dim] {result['total']:.4g}"
+    )
+    console.print(Panel(
+        Text.from_markup(
+            f"finalScore = ({result['total']:.4g} / {PA_SCALE}) × 100 = "
+            f"[bold green]{result['final_score']:.4g}[/bold green]"
+        ),
+        border_style="green", box=box.ROUNDED,
+    ))
     return 0
 
 
@@ -1190,17 +1454,30 @@ def cmd_profile(token: str | None, name: str | None) -> int:
     raw = fetch_profile(resolve_token(token)) if token else read_profile_file(name or "")
     raw = unwrap_profile(raw)
     pruned = prune_profile(raw)
-    print(f"\nTop-level fields ({len(raw)} returned, {len(pruned)} after pruning):\n")
+    table = Table(
+        title=f"Top-level fields · {len(raw)} returned · {len(pruned)} kept",
+        box=box.SIMPLE_HEAVY, title_style="bold", header_style="bold cyan",
+    )
+    table.add_column("")
+    table.add_column("Field")
+    table.add_column("Size", justify="right")
     for key in raw:
         size = len(json.dumps(raw[key]))
-        mark = " " if key in pruned else "-"  # '-' was dropped as bulk or secret
-        print(f" {mark} {key:<32} {size:>7} chars")
+        if key in pruned:
+            table.add_row("[green]●[/green]", key, f"[green]{size}[/green]")
+        else:
+            table.add_row("[red]✗[/red]", f"[dim]{key}[/dim]", f"[dim]{size}[/dim]")
+    console.print()
+    console.print(table)
     text = profile_from(raw)
-    print(f"\nRendered for the prompt: {len(text)} chars, roughly"
-          f" {len(text) // 4} tokens of NUM_CTX.\n")
-    print(text)
-    print("\nToo big? Set HRMS_PROFILE_FIELDS to a comma-separated list of the"
-          " fields above.")
+    console.print()
+    console.print(Panel(
+        text or "[dim](empty)[/dim]",
+        title=f"Rendered for the prompt · {len(text)} chars · ~{len(text) // 4} tokens",
+        title_align="left", border_style="cyan", box=box.ROUNDED,
+    ))
+    console.print("[dim]Too big? Set HRMS_PROFILE_FIELDS to a comma-separated"
+                  " list of the fields above.[/dim]")
     return 0
 
 
