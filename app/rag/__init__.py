@@ -42,6 +42,7 @@ from .cli import (  # noqa: E402
     cmd_ask,
     cmd_chat,
     cmd_discover,
+    cmd_feedback,
     cmd_ingest,
     cmd_pa,
     cmd_profile,
