@@ -41,6 +41,7 @@ from .profile import (
     resolve_token,
     unwrap_profile,
 )
+from .feedback import cmd_feedback
 from .ingest import cmd_ingest
 from .ui import chat_banner, console, err_console, waiting
 
@@ -322,6 +323,9 @@ def parse_args() -> argparse.Namespace:
     p = sub.add_parser("pa", help="compute a PA score from a JSON file of feedback")
     p.add_argument("path", help="JSON with client_weight, team_weight and criteria")
 
+    p = sub.add_parser("feedback", help="interactively fill a peer-feedback CSV")
+    p.add_argument("path", help="the blank feedback CSV to fill")
+
     p = sub.add_parser("profile", help="show what the HRMS returns about you")
     add_profile_args(p)
 
@@ -349,6 +353,8 @@ def main() -> int:
             return cmd_discover()
         if args.command == "pa":
             return cmd_pa(args.path)
+        if args.command == "feedback":
+            return cmd_feedback(args.path)
         if args.command == "profile":
             return cmd_profile(chosen_token(args), args.profile)
         if args.command == "stats":
