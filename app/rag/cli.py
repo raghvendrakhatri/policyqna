@@ -51,8 +51,9 @@ def cmd_ask(question: str, k: int, token: str | None, profile_name: str | None,
     if not indexed():
         sys.exit("Nothing indexed yet - run `ingest` first.")
     provenance = Provenance() if sources else None
-    chain = build_chain(k, profile_text(token, profile_name), provenance)
-    ask(chain, question, provenance)
+    profile = profile_text(token, profile_name)
+    chain = build_chain(k, profile, provenance)
+    ask(chain, question, provenance, profile)
     return 0
 
 
@@ -96,7 +97,7 @@ def cmd_chat(k: int, token: str | None, profile_name: str | None, sources: bool)
             if standalone != question:
                 err_console.print(f"[dim italic]· reading that as: {standalone}[/dim italic]")
 
-        answer = ask(chain, standalone, provenance)
+        answer = ask(chain, standalone, provenance, profile)
         if answer:
             memory.remember(standalone, answer)
 

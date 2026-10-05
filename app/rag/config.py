@@ -134,6 +134,17 @@ MMR_FETCH_K = 30
 # the very section being asked about; 0.8 keeps relevance in charge.
 MMR_LAMBDA = 0.8
 
+# Below this normalised cosine score (0..1) no indexed chunk is close enough to
+# the question for an answer to be grounded. Tuned on in-domain questions
+# scoring ~0.45+ and off-topic ones ("capital of France") scoring <0.25.
+RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD", "0.30"))
+# A question with "my", "I", "me" may be answered from the HRMS profile alone,
+# so a low retrieval score is not grounds to refuse it.
+PERSONAL_RE = re.compile(
+    r"\b(my|mine|me|i|i'm|im|i've|ive|i'd|id|myself)\b",
+    re.I,
+)
+
 
 SYSTEM_PROMPT = """You answer questions about the policy documents given as context.
 
@@ -239,6 +250,29 @@ Example
   New Q: what is my daily food allowance?
   New A: 1,900 - Gold band, Tier 1.
   out: user is Gold band, Tier 1, WFH balance 13.0 days as of 2026-09-23; daily food allowance 1,900."""
+
+
+TOPICALITY_PROMPT = """You are a classifier for a company HR/policy assistant.
+
+Decide if the question is in scope. Reply with exactly one word: yes or no.
+
+In scope: company policies, employee benefits, leave, work-from-home,
+reimbursement, performance appraisal, HR processes, workplace rules, and
+anything about the asker's own HRMS record (balances, band, manager, joining
+date, city tier, etc.).
+
+Out of scope: general knowledge (geography, history, trivia, sports), coding
+or technical help, creative writing, math/calculations unrelated to policy,
+current events, other companies, personal opinions, chit-chat.
+
+If the question is ambiguous but could plausibly be about company policy or
+the asker's record, answer yes.
+
+Always in scope (answer yes):
+- "who am I", "what is my name", "what is my role / band / designation"
+- "who is my manager", "when did I join", "what is my email"
+- "how many leaves / WFH days do I have left"
+- any question using "my", "I", "me" about work, role, HR, pay, or benefits."""
 
 
 SPLIT_PROMPT = """Split the question into the separate questions it literally contains.
