@@ -6,11 +6,20 @@ from functools import cache
 from typing import Annotated
 from urllib.parse import urlencode
 
+from langchain.tools import ToolRuntime
 from langchain_core.tools import InjectedToolArg, tool
 
 from .chain import doc_label
-from .config import HRMS_TIMEOUT, MMR_FETCH_K, MMR_LAMBDA, RELEVANCE_THRESHOLD, TOP_K
+from .config import (
+    HRMS_TIMEOUT,
+    MMR_FETCH_K,
+    MMR_LAMBDA,
+    RELEVANCE_THRESHOLD,
+    TOKEN_LOGIN,
+    TOP_K,
+)
 from .db import store
+from .profile import profile_from, resolve_token
 
 
 AUTH_BASE_URL = os.getenv("HRMS_AUTH_URL", "https://auth.dev2.autoscal.com")
@@ -222,7 +231,27 @@ def search_policy(query: str) -> dict:
     return {"results": [{"source": doc_label(d), "text": d.page_content} for d in docs]}
 
 
+@tool
+def login(runtime: ToolRuntime) -> str:
+    """Log the employee in to the HRMS by opening its login page in their
+    browser. Call this when they ask to log in, or before any HRMS tool when
+    they are not logged in yet."""
+    try:
+        token = resolve_token(TOKEN_LOGIN)
+    except SystemExit as exc:  # the login flow exits on failure; a tool must not
+        return f"Login failed: {exc}"
+    # The session lives in the run context, never in a message: the model does
+    # not see the token, and every later tool call in the chat picks it up.
+    details = hrms_request(f"{AUTH_BASE_URL}/api/users/me", token)
+    runtime.context.access_token = token
+    if details.get("error"):
+        return "Logged in, but the HRMS record could not be read."
+    runtime.context.profile = profile_from(details)
+    return "Logged in. The employee is:\n" + runtime.context.profile
+
+
 TOOLS = [
+    login,
     search_policy,
     get_user_details,
     get_holidays,

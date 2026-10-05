@@ -50,7 +50,7 @@ def refusal_panel(message: str, title: str = "Refused") -> Panel:
 
 
 def chat_banner(profile: str, token: str | None, profile_name: str | None,
-                sources: bool, k: int) -> Panel:
+                sources: bool, k: int, tools: list[str] | None = None) -> Panel:
     """Header panel shown once at the top of a chat session."""
     rows = [
         ("chat", f"[cyan]{env('CHAT_MODEL')}[/cyan]"),
@@ -64,7 +64,13 @@ def chat_banner(profile: str, token: str | None, profile_name: str | None,
         rows.append(("profile", f"[green]{profile_name} (offline)[/green]"))
     else:
         rows.append(("profile", "[dim]none — generic answers[/dim]"))
-    rows.append(("sources", "[green]on[/green]" if sources else "[dim]off[/dim]"))
+    if tools is not None:
+        rows.append(("tools", f"[green]{len(tools)}[/green] · {', '.join(tools)}"))
+        if not token:
+            rows.append(("", "[yellow]not logged in · asks before opening the HRMS"
+                             " login when a question needs it[/yellow]"))
+    else:
+        rows.append(("sources", "[green]on[/green]" if sources else "[dim]off[/dim]"))
     rows.append(("memory", f"[green]on[/green] · last {MEMORY_WINDOW} turns + running summary · [dim]in RAM only[/dim]"))
     rows.append(("k", f"[cyan]{k}[/cyan] chunks per question"))
     body = Text()
@@ -73,5 +79,6 @@ def chat_banner(profile: str, token: str | None, profile_name: str | None,
         body.append_text(Text.from_markup(value))
         body.append("\n")
     body.append("\n  Ctrl-C or empty line to quit.", style="dim italic")
-    return Panel(body, title="[bold]policyqa · chat[/bold]",
+    title = "policyqa · chat · tools" if tools is not None else "policyqa · chat"
+    return Panel(body, title=f"[bold]{title}[/bold]",
                  title_align="left", border_style="magenta", box=box.ROUNDED)
