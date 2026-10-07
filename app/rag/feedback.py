@@ -50,8 +50,10 @@ Ground rules (all of them, not just the first one you notice):
 - Refer to the colleague as '{pronoun}' (never the name; the name is already
   above every column).
 - Keep it plain and direct. No preamble, no praise sandwich, no closing line.
-- A sub-category the note doesn't touch gets a short line consistent with the
-  score - one clause, not a paragraph. Score 5 = exceptional, 4 = strong,
+- Each sub-category remark must be a complete, proper sentence (subject +
+  verb, ending with a period) - not a fragment, clause, or bullet phrase.
+- A sub-category the note doesn't touch still gets a complete sentence
+  consistent with the score. Score 5 = exceptional, 4 = strong,
   3 = solid/expected, 2 = inconsistent, 1 = a real gap.
 
 Output format (exactly this, nothing else):
@@ -60,9 +62,9 @@ Output format (exactly this, nothing else):
 <one or two sentences summarising the section>
 
 [Sub-category Remarks]
-- <sub-category>: <one line>
-- <sub-category>: <one line>
-...one line per sub-category listed below, in order...
+- <sub-category>: <one complete sentence ending with a period>
+- <sub-category>: <one complete sentence ending with a period>
+...one sentence per sub-category listed below, in order...
 
 Colleague: {name}
 Section: {section} (score {score}/5)

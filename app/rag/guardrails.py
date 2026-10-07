@@ -10,7 +10,7 @@ import sys
 
 from langchain_ollama import ChatOllama
 
-from .config import KEEP_ALIVE, env
+from .config import KEEP_ALIVE, TOPICALITY_PROMPT, env
 
 
 # Prompt-injection patterns. A user question should never try to reset the
@@ -27,6 +27,11 @@ INJECTION = re.compile(
 )
 MAX_QUESTION_CHARS = 2000
 REFUSAL = "I can only answer questions about the indexed policy documents."
+OFF_TOPIC_REFUSAL = (
+    "That question is outside the scope of our policy documents and your HRMS"
+    " record. I can only help with company policy, benefits, leave, WFH,"
+    " reimbursement, performance, or your own HRMS details."
+)
 UNSAFE_REFUSAL = "That request was flagged as unsafe and won't be answered."
 UNSAFE_OUTPUT = "The generated answer was flagged as unsafe and has been suppressed."
 
@@ -78,6 +83,44 @@ def check_safety(text: str, role: str) -> str | None:
         return None
     lines = verdict.splitlines()
     return lines[1].strip() if len(lines) > 1 else "unsafe"
+
+
+# Topicality classifier: a cheap yes/no on the chat model to catch off-topic
+# questions ("capital of France", "write me Python") that neither the injection
+# regex nor LlamaGuard reject. The chat model is already resident, so this is
+# one extra forward pass of a few tokens. Opt-out with TOPICALITY_CHECK=0.
+_topicality_llm: "ChatOllama | None" = None
+
+
+def topicality_llm() -> "ChatOllama":
+    global _topicality_llm
+    if _topicality_llm is None:
+        _topicality_llm = ChatOllama(
+            model=env("CHAT_MODEL"),
+            base_url=env("OLLAMA_BASE_URL"),
+            temperature=0,
+            keep_alive=KEEP_ALIVE,
+            num_predict=4,  # "yes" / "no" and nothing more
+        )
+    return _topicality_llm
+
+
+def check_topicality(question: str) -> bool:
+    """True when the question is in scope for a policy/HRMS assistant.
+
+    Fails open: a classifier error must not block a legitimate question.
+    """
+    if os.getenv("TOPICALITY_CHECK", "1").lower() in ("0", "false", "no", "off"):
+        return True
+    try:
+        verdict = topicality_llm().invoke(
+            [("system", TOPICALITY_PROMPT), ("human", question)]
+        ).content.strip().lower()
+    except Exception as exc:  # noqa: BLE001 - a classifier failure must not block
+        print(f"Topicality check skipped: {exc}", file=sys.stderr)
+        return True
+    verdict = clean(verdict)
+    return verdict.startswith("yes")
 
 
 def guard_input(question: str) -> str | None:

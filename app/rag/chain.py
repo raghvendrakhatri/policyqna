@@ -26,15 +26,19 @@ from .config import (
     MIN_SUB_K,
     MMR_FETCH_K,
     MMR_LAMBDA,
+    PERSONAL_RE,
     PROFILE_PROMPT,
+    RELEVANCE_THRESHOLD,
     SPLIT_PROMPT,
     SYSTEM_PROMPT,
 )
 from .db import store
 from .guardrails import (
+    OFF_TOPIC_REFUSAL,
     REFUSAL,
     UNSAFE_OUTPUT,
     check_safety,
+    check_topicality,
     clean,
     guard_input,
 )
@@ -134,6 +138,21 @@ def build_chain(k: int, profile: str = "", provenance: "Provenance | None" = Non
         """Retrieve per sub-question, then merge - a union, not an average."""
         subs = subquestions(question)
         per_sub = k if len(subs) == 1 else max(MIN_SUB_K, k // len(subs))
+        # Relevance pre-check: one scored query on the original question. MMR
+        # alone always returns k docs whether they match or not, so an off-topic
+        # question still gets a context full of unrelated policy. If the best
+        # match in the index is below the threshold, nothing here can ground an
+        # answer - unless the question is personal, in which case the HRMS
+        # profile may answer it on its own.
+        personal = bool(PERSONAL_RE.search(question))
+        try:
+            top_scored = vectors.similarity_search_with_relevance_scores(question, k=1)
+        except Exception:  # noqa: BLE001 - a scoring hiccup must not block retrieval
+            top_scored = []
+        top_score = top_scored[0][1] if top_scored else 0.0
+        on_topic = top_score >= RELEVANCE_THRESHOLD
+        if not on_topic and not (personal and profile):
+            raise NoContext()
         if len(subs) > 1:
             status(f"answering {len(subs)} parts, {per_sub} chunks each")
         retriever = vectors.as_retriever(
@@ -146,16 +165,16 @@ def build_chain(k: int, profile: str = "", provenance: "Provenance | None" = Non
         )
         seen: set[str] = set()
         docs: list[Document] = []
-        for sub in subs:
-            for doc in retriever.invoke(sub):
-                if doc.id not in seen:
-                    seen.add(doc.id)
-                    docs.append(doc)
+        if on_topic:
+            for sub in subs:
+                for doc in retriever.invoke(sub):
+                    if doc.id not in seen:
+                        seen.add(doc.id)
+                        docs.append(doc)
         if provenance is not None:
             provenance.docs = docs  # this question's chunks, not the last one's
-        # Retrieval guardrail: if nothing came back, the model would hallucinate
-        # against an empty context. Raising here lets ask() print the refusal
-        # instead of asking the model to answer from thin air.
+        # Retrieval guardrail: if nothing came back and no profile/knowledge is
+        # in scope either, the model would hallucinate against an empty context.
         if not docs and not knowledge and not profile:
             raise NoContext()
         return docs
@@ -354,21 +373,39 @@ def credit(answer: str, provenance: "Provenance") -> str:
     return " - ".join(parts)
 
 
-def ask(chain, question: str, provenance: "Provenance | None" = None) -> str:
+def ask(chain, question: str, provenance: "Provenance | None" = None,
+        profile: str = "") -> str:
     refusal = guard_input(question)
     if refusal:
         console.print()
         console.print(refusal_panel(refusal))
         console.print()
         return refusal
+    # Topicality classifier: catches off-topic questions ("capital of France",
+    # "write me Python code") that score low on retrieval but may spuriously
+    # match a chunk. One short LLM call on the already-resident chat model.
+    # Short-circuit for personal questions when a profile is loaded - "who am
+    # I", "what's my band" are always answerable from the HRMS record, and the
+    # classifier has been known to reject them for lack of a policy angle.
+    personal = bool(PERSONAL_RE.search(question)) and bool(profile)
+    if personal:
+        on_topic = True
+    else:
+        with waiting("checking scope"):
+            on_topic = check_topicality(question)
+    if not on_topic:
+        console.print()
+        console.print(refusal_panel(OFF_TOPIC_REFUSAL, title="Out of scope"))
+        console.print()
+        return OFF_TOPIC_REFUSAL
     try:
         with waiting("thinking"):
             answer = chain.invoke(question)
     except NoContext:
         console.print()
-        console.print(refusal_panel(REFUSAL, title="No matching policy"))
+        console.print(refusal_panel(OFF_TOPIC_REFUSAL, title="No matching policy"))
         console.print()
-        return REFUSAL
+        return OFF_TOPIC_REFUSAL
     cleaned = clean(answer)
     unsafe = check_safety(cleaned, "ai") if cleaned else None
     if unsafe:

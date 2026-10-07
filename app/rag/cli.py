@@ -11,6 +11,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from .agent import Agent, ask_agent
 from .chain import (
     Memory,
     Provenance,
@@ -43,6 +44,7 @@ from .profile import (
 )
 from .feedback import cmd_feedback
 from .ingest import cmd_ingest
+from .tools import get_user_details
 from .ui import chat_banner, console, err_console, waiting
 
 
@@ -51,19 +53,28 @@ def cmd_ask(question: str, k: int, token: str | None, profile_name: str | None,
     if not indexed():
         sys.exit("Nothing indexed yet - run `ingest` first.")
     provenance = Provenance() if sources else None
-    chain = build_chain(k, profile_text(token, profile_name), provenance)
-    ask(chain, question, provenance)
+    profile = session_profile(resolve_token(token), profile_name)
+    chain = build_chain(k, profile, provenance)
+    ask(chain, question, provenance, profile)
     return 0
 
 
-def cmd_chat(k: int, token: str | None, profile_name: str | None, sources: bool) -> int:
+def cmd_chat(k: int, token: str | None, profile_name: str | None, sources: bool,
+             tools: bool = True) -> int:
     if not indexed():
         sys.exit("Nothing indexed yet - run `ingest` first.")
+    # Resolved once, so --login opens one browser and the agent's tools get the
+    # same session the profile was read with.
+    token = resolve_token(token)
     # Fetched once per session, not per question: a chat would otherwise hammer
-    # the HRMS, and the balances should not shift underneath a conversation.
-    profile = profile_text(token, profile_name)
-    provenance = Provenance() if sources else None
+    # the HRMS, and the details should not shift underneath a conversation.
+    profile = session_profile(token, profile_name)
     memory = Memory(summariser=build_summariser())
+    # The agent by default: it can log in mid-chat, so it needs no token up front.
+    if tools:
+        return agent_loop(Agent(token, profile, memory), memory, profile, token,
+                          profile_name, k)
+    provenance = Provenance() if sources else None
     chain = build_chain(k, profile, provenance, memory=memory)  # built once
     contextualize = build_contextualizer()
 
@@ -96,9 +107,47 @@ def cmd_chat(k: int, token: str | None, profile_name: str | None, sources: bool)
             if standalone != question:
                 err_console.print(f"[dim italic]· reading that as: {standalone}[/dim italic]")
 
-        answer = ask(chain, standalone, provenance)
+        answer = ask(chain, standalone, provenance, profile)
         if answer:
             memory.remember(standalone, answer)
+
+
+def session_profile(token: str | None, profile_name: str | None) -> str:
+    """After login, only the employee's own record is loaded. Balances, leave
+    and attendance are read by the agent's tools when a question needs them."""
+    if token:
+        return user_details_profile(token)
+    return profile_text(None, profile_name)
+
+
+def user_details_profile(token: str) -> str:
+    """The employee's own record from the same HRMS the tools talk to."""
+    with waiting("reading your HRMS record"):
+        details = get_user_details.invoke({"access_token": token})
+    if details.get("error"):
+        sys.exit(f"Could not read your HRMS record: {details['error']}"
+                 f"\n{details.get('detail', '')}\nLog in again with --login.")
+    return profile_from(details)
+
+
+def agent_loop(agent: Agent, memory: Memory, profile: str, token: str | None,
+               profile_name: str | None, k: int) -> int:
+    """`chat --tools`. No follow-up rewrite: the agent reads the history itself."""
+    console.print()
+    console.print(chat_banner(profile, token, profile_name, False, k,
+                              tools=sorted(agent.tools)))
+    while True:
+        try:
+            console.print()
+            question = console.input("[bold cyan]❯[/bold cyan] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            return 0
+        if not question:
+            return 0
+        answer = ask_agent(agent, question, profile)
+        if answer:
+            memory.remember(question, answer)
 
 
 def cmd_stats() -> int:
@@ -316,6 +365,11 @@ def parse_args() -> argparse.Namespace:
 
     p = sub.add_parser("chat", help="interactive question loop")
     p.add_argument("-k", type=int, default=TOP_K)
+    p.add_argument(
+        "--no-tools",
+        action="store_true",
+        help="plain policy Q&A: no HRMS tools, no applying, no logging in mid-chat",
+    )
     add_profile_args(p)
 
     sub.add_parser("discover", help="find the HRMS endpoint holding your record")
@@ -348,7 +402,8 @@ def main() -> int:
             return cmd_ask(" ".join(args.question), args.k, chosen_token(args),
                            args.profile, not args.no_sources)
         if args.command == "chat":
-            return cmd_chat(args.k, chosen_token(args), args.profile, not args.no_sources)
+            return cmd_chat(args.k, chosen_token(args), args.profile, not args.no_sources,
+                            not args.no_tools)
         if args.command == "discover":
             return cmd_discover()
         if args.command == "pa":
