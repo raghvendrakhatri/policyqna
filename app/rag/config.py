@@ -281,6 +281,10 @@ Always in scope (answer yes):
 # cannot loop forever; tool results are capped because NUM_CTX holds them all.
 AGENT_MAX_STEPS = 5
 TOOL_RESULT_MAX_CHARS = 8000
+# Every question is searched against the policy before the model sees it, so
+# a policy answer never depends on a 4B model choosing to call search_policy.
+# Fewer chunks than TOP_K: they ride along with every question, HRMS ones too.
+AGENT_PREFETCH_K = 5
 
 AGENT_PROMPT = """You are an HR assistant for the company. You answer questions about
 company policy and act on the employee's behalf in the HRMS, using the tools.
@@ -316,6 +320,29 @@ AGENT_NO_LOGIN_PROMPT = """- The employee is NOT logged in to the HRMS yet. Befo
   call the login tool. It asks them to confirm and opens the login page; once
   it succeeds, carry on with what they asked. Policy questions need no login.
 """
+
+# The agent's version of KNOWLEDGE_PROMPT. That one calls the notes authoritative
+# "even when the context below says nothing", which in chat sits above the
+# retrieved policy. In the agent nothing follows it, so a model reading a leave
+# question checked these notes, found no encashment, and said it did not know.
+AGENT_KNOWLEDGE_PROMPT = """
+
+Reference notes: formulas, definitions and which source wins. They are NOT the
+policy and cover only a few topics - a term missing from them says nothing
+about whether the policy covers it. Use a formula exactly as written, showing
+the substituted numbers.
+
+{knowledge}"""
+
+# Put in front of the employee's question with whatever the policy search found.
+AGENT_EXCERPTS_PROMPT = """Policy excerpts found for this question (search_policy has already run):
+
+{excerpts}
+
+Answer from these when the question is about policy. Call search_policy again
+only for a different topic they do not cover.
+
+Question: {question}"""
 
 # The agent's profile section. Not PROFILE_PROMPT: that one tells the model the
 # policy is already "in the context above", which in agent mode it is not - and

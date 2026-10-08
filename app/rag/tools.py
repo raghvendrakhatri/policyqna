@@ -210,6 +210,21 @@ def policy_store():
     return store()
 
 
+def find_policy(query: str, k: int = TOP_K) -> list[dict]:
+    """The policy chunks for a query, each with its source; empty when nothing
+    in the index is about it."""
+    vectors = policy_store()
+    # MMR always returns k chunks whether they match or not, so check the best
+    # match first: below the threshold, nothing in the index is about this.
+    top = vectors.similarity_search_with_relevance_scores(query, k=1)
+    if not top or top[0][1] < RELEVANCE_THRESHOLD:
+        return []
+    docs = vectors.max_marginal_relevance_search(
+        query, k=k, fetch_k=max(MMR_FETCH_K, k * 5), lambda_mult=MMR_LAMBDA,
+    )
+    return [{"source": doc_label(d), "text": d.page_content} for d in docs]
+
+
 @tool(parse_docstring=True)
 def search_policy(query: str) -> dict:
     """Search the company policy documents: leave rules, WFH policy,
@@ -219,16 +234,10 @@ def search_policy(query: str) -> dict:
     Args:
         query: What to look up, as a standalone question or phrase.
     """
-    vectors = policy_store()
-    # MMR always returns k chunks whether they match or not, so check the best
-    # match first: below the threshold, nothing in the index is about this.
-    top = vectors.similarity_search_with_relevance_scores(query, k=1)
-    if not top or top[0][1] < RELEVANCE_THRESHOLD:
+    results = find_policy(query)
+    if not results:
         return {"results": [], "note": "No policy document covers this."}
-    docs = vectors.max_marginal_relevance_search(
-        query, k=TOP_K, fetch_k=MMR_FETCH_K, lambda_mult=MMR_LAMBDA,
-    )
-    return {"results": [{"source": doc_label(d), "text": d.page_content} for d in docs]}
+    return {"results": results}
 
 
 @tool

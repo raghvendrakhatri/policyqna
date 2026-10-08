@@ -47,6 +47,13 @@ STRAY_CLOSE = re.compile(r"^.*?</(reasoning|analysis|think|thinking)>", re.S | r
 # Set SAFETY_MODEL=llama-guard3:1b in .env to enable; unset to skip. The 1B
 # variant is small enough to run per call without evicting the chat model.
 _safety_llm: "ChatOllama | None" = None
+# Categories that are not a harm here. S6 is "specialized advice" - financial,
+# medical, legal - and a policy answer about leave encashment or reimbursement
+# is exactly that by design; llama-guard suppressed such answers outright.
+SAFETY_IGNORE = {
+    c.strip().lower()
+    for c in os.getenv("SAFETY_IGNORE", "s6").split(",") if c.strip()
+}
 
 
 def safety_llm() -> "ChatOllama | None":
@@ -82,7 +89,11 @@ def check_safety(text: str, role: str) -> str | None:
     if verdict.startswith("safe"):
         return None
     lines = verdict.splitlines()
-    return lines[1].strip() if len(lines) > 1 else "unsafe"
+    if len(lines) < 2:
+        return "unsafe"
+    flagged = [c.strip() for c in lines[1].split(",") if c.strip()]
+    real = [c for c in flagged if c not in SAFETY_IGNORE]
+    return ",".join(real) if real else None
 
 
 # Topicality classifier: a cheap yes/no on the chat model to catch off-topic

@@ -37,7 +37,9 @@ from .config import (
     AGENT_NO_LOGIN_PROMPT,
     AGENT_PROFILE_PROMPT,
     AGENT_PROMPT,
-    KNOWLEDGE_PROMPT,
+    AGENT_EXCERPTS_PROMPT,
+    AGENT_KNOWLEDGE_PROMPT,
+    AGENT_PREFETCH_K,
     PERSONAL_RE,
     TOOL_RESULT_MAX_CHARS,
 )
@@ -51,7 +53,7 @@ from .guardrails import (
 )
 from .knowledge import load_knowledge
 from .models import llm
-from .tools import TOOLS
+from .tools import TOOLS, find_policy
 from .ui import console, err_console, refusal_panel, waiting
 
 
@@ -113,7 +115,7 @@ def build_system_prompt(profile: str, logged_in: bool, knowledge: str) -> str:
     # .replace, not .format: the knowledge and profile are arbitrary text whose
     # braces must stay literal.
     if knowledge:
-        system += KNOWLEDGE_PROMPT.replace("{knowledge}", knowledge)
+        system += AGENT_KNOWLEDGE_PROMPT.replace("{knowledge}", knowledge)
     if profile:
         system += AGENT_PROFILE_PROMPT.replace("{profile}", profile)
     return system
@@ -169,7 +171,7 @@ class Agent:
         messages: list = []
         if self.memory is not None:
             messages += self.memory.prior_messages() + self.memory.messages()
-        messages.append(HumanMessage(content=question))
+        messages.append(HumanMessage(content=with_policy(question)))
         config = {
             "configurable": {"thread_id": str(uuid.uuid4())},
             # Each step is a model call or a tool round; bound it.
@@ -204,6 +206,19 @@ class Agent:
             return {"type": "reject", "message": "The employee chose not to log in."}
         return {"type": "reject",
                 "message": "The employee declined, so nothing was submitted."}
+
+
+def with_policy(question: str) -> str:
+    """The question with the policy excerpts that match it, if any do."""
+    err_console.print(f"[dim]· search_policy(query={question!r})[/dim]")
+    with waiting("searching the policy"):
+        results = find_policy(question, k=AGENT_PREFETCH_K)
+    if not results:
+        return question
+    excerpts = "\n\n---\n\n".join(f"[{r['source']}]\n{r['text']}" for r in results)
+    # .replace, not .format: policy text can hold braces.
+    return (AGENT_EXCERPTS_PROMPT.replace("{excerpts}", excerpts)
+            .replace("{question}", question))
 
 
 def describe(args: dict) -> str:
