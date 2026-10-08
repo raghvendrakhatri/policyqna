@@ -6,7 +6,7 @@ system prompt on **every** question. Unlike an ingested document, nothing here
 can be missed by retrieval: the model always sees it, whatever was asked.
 
 That guarantee is paid for in context. Keep the folder small — a few thousand
-characters total. `rag.py` warns past 6000. Anything longer belongs in a document
+characters total. `app/rag/knowledge.py` warns past 6000. Anything longer belongs in a document
 you `ingest`.
 
 No restart concept: the files are re-read each time a chain is built, so `ask`

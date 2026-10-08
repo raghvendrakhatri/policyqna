@@ -181,6 +181,44 @@ def cmd_stats() -> int:
     return 0
 
 
+def cmd_check() -> int:
+    """Health check: can we reach Postgres and Ollama, and are the models pulled?"""
+    try:
+        with psycopg.connect(
+            dbname=os.getenv("POSTGRES_DB"),
+            user=os.getenv("POSTGRES_USER"),
+            password=os.getenv("POSTGRES_PASSWORD"),
+            host=os.getenv("POSTGRES_HOST", "localhost"),
+            port=os.getenv("POSTGRES_PORT"),
+            connect_timeout=5,
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT version()")
+                version = cur.fetchone()[0]
+    except psycopg.Error as exc:
+        print(f"Database ping failed: {exc}", file=sys.stderr)
+        return 1
+    print(f"Database OK: {version}")
+
+    import urllib.error
+    import urllib.request
+
+    base_url = os.getenv("OLLAMA_BASE_URL")
+    try:
+        with urllib.request.urlopen(f"{base_url}/api/tags", timeout=5) as response:
+            models = [m["name"] for m in json.load(response).get("models", [])]
+    except (urllib.error.URLError, OSError) as exc:
+        print(f"Ollama ping failed at {base_url}: {exc}", file=sys.stderr)
+        return 1
+    print(f"Ollama OK at {base_url}: {len(models)} model(s) available")
+
+    for var in ("CHAT_MODEL", "EMBED_MODEL"):
+        name = os.getenv(var)
+        if name and name not in models:
+            print(f"Warning: {var}={name} is not pulled. `ollama pull {name}`", file=sys.stderr)
+    return 0
+
+
 def cmd_reset() -> int:
     store().delete_collection()
     print(f"Dropped the '{COLLECTION}' collection.")
@@ -350,9 +388,11 @@ def add_profile_args(parser: argparse.ArgumentParser) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="rag", description="Ask questions about local policy documents, answered by Ollama."
+        prog="main.py", description="Ask questions about local policy documents, answered by Ollama."
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("check", help="health check: Postgres and Ollama up, models pulled")
 
     p = sub.add_parser("ingest", help="chunk, embed and store a document")
     p.add_argument("path", nargs="?", default="data/policy.pdf")
@@ -394,6 +434,9 @@ def main() -> int:
     missing = [n for n in REQUIRED_ENV if not os.getenv(n)]
     if missing:
         sys.exit(f"Missing env vars: {', '.join(missing)}. Copy .env.example to .env.")
+
+    if args.command == "check":
+        return cmd_check()
 
     try:
         if args.command == "ingest":

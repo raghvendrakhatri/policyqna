@@ -124,7 +124,7 @@ preview but never POSTs.
 
 ### 8. CLI
 
-- New subcommand: `python -m app.rag agent` — same flags as `chat` plus
+- New subcommand: `python app/main.py agent` — same flags as `chat` plus
   `--dry-run`, `--max-writes N`.
 - `chat` stays read-only (no tools). `ask` stays read-only.
 - Banner shows: `agent mode · writes: enabled · dry-run: off · staging`.
