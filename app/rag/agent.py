@@ -40,6 +40,7 @@ from .config import (
     AGENT_EXCERPTS_PROMPT,
     AGENT_KNOWLEDGE_PROMPT,
     AGENT_PREFETCH_K,
+    ACTION_RE,
     PERSONAL_RE,
     TOOL_RESULT_MAX_CHARS,
 )
@@ -267,7 +268,8 @@ def ask_agent(agent: Agent, question: str, profile: str = "") -> str:
         return refusal
     # "apply wfh for me", "my balance": about the employee, so in scope. Without
     # a login the agent itself says so, which beats an "out of scope" refusal.
-    personal = bool(PERSONAL_RE.search(question))
+    action = bool(ACTION_RE.search(question))
+    personal = action or bool(PERSONAL_RE.search(question))
     # "yes", "tomorrow", "do it": an answer to the agent's own question. Out of
     # context the classifier rejects it; the conversation is what makes it fit.
     reply = bool(agent.memory and agent.memory.history) and looks_like_followup(question)
@@ -278,7 +280,9 @@ def ask_agent(agent: Agent, question: str, profile: str = "") -> str:
             console.print()
             console.print(refusal_panel(OFF_TOPIC_REFUSAL, title="Out of scope"))
             return OFF_TOPIC_REFUSAL
-    answer = agent.run(question, prefetch=not reply)
+    # An action needs the HRMS tools, not policy text: the excerpts only give
+    # the model things to ask about. It can still call search_policy itself.
+    answer = agent.run(question, prefetch=not (reply or action))
     unsafe = check_safety(answer, "ai") if answer else None
     if unsafe:
         err_console.print(f"[red]Output flagged unsafe: {unsafe}[/red]")

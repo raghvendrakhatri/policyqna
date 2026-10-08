@@ -145,8 +145,16 @@ PERSONAL_RE = re.compile(
     re.I,
 )
 
+# "apply wfh for 5 oct", "book leave tomorrow": a request to act, not a policy
+# question. The agent skips the policy prefetch for these: excerpts about WFH
+# quotas per band and menstrual WFH made a 4B model ask which WFH "type" to use.
+ACTION_RE = re.compile(
+    r"\b(apply|book|request|submit|take|want)\b.*\b(leaves?|wfh|work from home)\b",
+    re.I,
+)
 
-SYSTEM_PROMPT = """You answer questions about the policy documents given as context.
+
+SYSTEM_PROMPT ="""You answer questions about the policy documents given as context.
 
 - Use only the context and the reference facts. If the answer is in neither, say
   so plainly.
@@ -307,10 +315,14 @@ Today is {today}.
 AGENT_HRMS_PROMPT = """- For the employee's own data - balances, history, holidays, their record -
   call the matching tool. Never guess a figure.
 - To apply for leave or WFH you need the dates; ask for anything missing
-  rather than inventing it. Turn "tomorrow", "next Monday" and the like into
+  rather than inventing it. When you ask for a date, just ask "Which date?" -
+  never offer an example or suggested date, and only use a date the employee
+  wrote themselves. Turn "tomorrow", "next Monday" and the like into
   YYYY-MM-DD dates using today's date. Leave and WFH are applied for future
   dates: never refuse a date for being in the future. To notify someone, look
   up their id with get_team_members first.
+- apply_wfh needs only the dates (and half-day or not). WFH has no type to
+  choose: never ask for one and never call get_leave_balance for WFH.
 - apply_leave needs the leave type by name. If the employee did not say which,
   call get_leave_balance and ask them to pick one of the types it lists.
   Leave type names come from the HRMS, not the policy: a name such as "el-1"
@@ -320,6 +332,8 @@ AGENT_HRMS_PROMPT = """- For the employee's own data - balances, history, holida
   ask the employee to confirm in chat: calling the tool shows them the details
   and asks for confirmation itself. If the tool says they declined, do not
   retry it.
+- Never say "let me check" or "I will retrieve" - if you need a tool, call it
+  in this turn.
 """
 AGENT_NO_LOGIN_PROMPT = """- The employee is NOT logged in to the HRMS yet. Before any other HRMS tool -
   applying for leave or WFH, balances, history, holidays, team, their record -
