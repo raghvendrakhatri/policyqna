@@ -167,11 +167,14 @@ class Agent:
     def token(self) -> str | None:
         return self.context.access_token
 
-    def run(self, question: str) -> str:
+    def run(self, question: str, prefetch: bool = True) -> str:
+        """`prefetch=False` for a reply to the agent's own question ("el-1",
+        "yes"): searched alone it matches policy text that says nothing about
+        it, and the model reads that as the answer being wrong."""
         messages: list = []
         if self.memory is not None:
             messages += self.memory.prior_messages() + self.memory.messages()
-        messages.append(HumanMessage(content=with_policy(question)))
+        messages.append(HumanMessage(content=with_policy(question) if prefetch else question))
         config = {
             "configurable": {"thread_id": str(uuid.uuid4())},
             # Each step is a model call or a tool round; bound it.
@@ -275,7 +278,7 @@ def ask_agent(agent: Agent, question: str, profile: str = "") -> str:
             console.print()
             console.print(refusal_panel(OFF_TOPIC_REFUSAL, title="Out of scope"))
             return OFF_TOPIC_REFUSAL
-    answer = agent.run(question)
+    answer = agent.run(question, prefetch=not reply)
     unsafe = check_safety(answer, "ai") if answer else None
     if unsafe:
         err_console.print(f"[red]Output flagged unsafe: {unsafe}[/red]")

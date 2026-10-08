@@ -1,5 +1,6 @@
 import json
 import os
+import re
 import urllib.error
 import urllib.request
 from functools import cache
@@ -125,10 +126,77 @@ def get_team_members(
     return result
 
 
+# Fields of a leave-dashboard entry worth showing the model: the balance and
+# what makes it up. The rest is scheme configuration (see PROFILE_DROP).
+BALANCE_RE = re.compile(r"balance|available|allocated|used|taken|remaining|booked|pending", re.I)
+
+
+def leave_types(data) -> list[dict]:
+    """The leave types in a leave-dashboard response, each as {id, name, ...}.
+
+    An entry is a dict naming its type, either directly (`leave_type_id` and a
+    name) or through a nested `leave_type` object. A matched entry is not walked
+    into: its approval chains carry other employees' {id, name} records.
+    """
+    found: dict[str, dict] = {}
+
+    def walk(node) -> None:
+        if isinstance(node, list):
+            for item in node:
+                walk(item)
+            return
+        if not isinstance(node, dict):
+            return
+        nested = node.get("leave_type") if isinstance(node.get("leave_type"), dict) else {}
+        type_id = node.get("leave_type_id") or nested.get("id")
+        name = nested.get("name") or node.get("leave_type_name") or node.get("name")
+        if type_id and name:
+            entry = {"id": str(type_id), "name": str(name)}
+            entry.update({k: v for k, v in node.items()
+                          if BALANCE_RE.search(k) and not isinstance(v, (dict, list))})
+            found.setdefault(entry["id"], entry)
+            return
+        for value in node.values():
+            walk(value)
+
+    walk(data)
+    return list(found.values())
+
+
+def match_leave_type(types: list[dict], wanted: str) -> dict | None:
+    """The one type whose name is `wanted`, or the only one containing it:
+    "casual" finds "Casual Leave". None when nothing or several match."""
+    wanted = wanted.strip().lower()
+    exact = [t for t in types if t["name"].lower() == wanted]
+    if exact:
+        return exact[0]
+    partial = [t for t in types if wanted in t["name"].lower()]
+    return partial[0] if len(partial) == 1 else None
+
+
+def fetch_leave_types(access_token: str) -> list[dict] | dict:
+    """The employee's leave types, or the HRMS error dict."""
+    data = hrms_request(f"{ATTENDANCE_BASE_URL}/api/leaves/dashboard", access_token)
+    if isinstance(data, dict) and data.get("error"):
+        return data
+    return leave_types(data)
+
+
+@tool
+def get_leave_balance(access_token: Annotated[str, InjectedToolArg]) -> dict:
+    """Get the leave types the employee can apply for and the balance of each.
+    Use the names it returns as apply_leave's leave_type."""
+    types = fetch_leave_types(access_token)
+    if isinstance(types, dict):
+        return types
+    # The ids stay here: apply_leave looks them up by name itself.
+    return {"leave_types": [{k: v for k, v in t.items() if k != "id"} for t in types]}
+
+
 @tool(parse_docstring=True)
 def apply_leave(
     access_token: Annotated[str, InjectedToolArg],
-    leave_type_id: str,
+    leave_type: str,
     start_date: str,
     end_date: str,
     is_half_day: bool = False,
@@ -138,15 +206,24 @@ def apply_leave(
     have clearly asked to apply and confirmed the details.
 
     Args:
-        leave_type_id: Id of the leave type to apply for.
+        leave_type: Name of the leave type, such as "Casual Leave", as
+            get_leave_balance lists it.
         start_date: First day of leave, YYYY-MM-DD.
         end_date: Last day of leave, YYYY-MM-DD. Same as start_date for one day.
         is_half_day: True for a half-day leave on a single date.
         people_to_notify: Ids of colleagues to notify, from get_team_members.
             Omit to notify nobody.
     """
+    types = fetch_leave_types(access_token)
+    if isinstance(types, dict):
+        return types
+    match = match_leave_type(types, leave_type)
+    if match is None:
+        return {"error": f"No single leave type matches {leave_type!r}. "
+                         "Ask the employee which one they mean.",
+                "leave_types": [t["name"] for t in types]}
     body = {
-        "leave_type_id": leave_type_id,
+        "leave_type_id": match["id"],
         "start_date": start_date,
         "end_date": end_date,
         "is_half_day": is_half_day,
@@ -266,6 +343,7 @@ TOOLS = [
     get_holidays,
     get_leave_history,
     get_team_members,
+    get_leave_balance,
     apply_leave,
     get_wfh_balance,
     get_wfh_history,
