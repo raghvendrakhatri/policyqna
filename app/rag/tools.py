@@ -1,6 +1,5 @@
 import json
 import os
-import re
 import urllib.error
 import urllib.request
 from functools import cache
@@ -126,41 +125,69 @@ def get_team_members(
     return result
 
 
-# Fields of a leave-dashboard entry worth showing the model: the balance and
-# what makes it up. The rest is scheme configuration (see PROFILE_DROP).
-BALANCE_RE = re.compile(r"balance|available|allocated|used|taken|remaining|booked|pending", re.I)
+def dashboard_part(data, *keys):
+    """`data["data"][keys...]` of a leave-dashboard response, or None."""
+    node = data.get("data") if isinstance(data, dict) else None
+    for key in keys:
+        node = node.get(key) if isinstance(node, dict) else None
+    return node
+
+
+def prior_notice(rules) -> list[str]:
+    """A type's prior-notice rules as sentences the model can quote."""
+    return [f"{r['calendar_days_notice']} calendar days' notice for "
+            f"{r['min_leave_days_required']} or more days of leave"
+            for r in rules or []
+            if r.get("calendar_days_notice") is not None]
 
 
 def leave_types(data) -> list[dict]:
-    """The leave types in a leave-dashboard response, each as {id, name, ...}.
+    """The leave types in a leave-dashboard response, each as {id, name, ...}
+    with its balance and the rules that decide whether an application goes
+    through. The rest of each entry is scheme configuration, and its approval
+    chain holds other employees' records: neither reaches the model."""
+    types = []
+    for entry in dashboard_part(data, "leaves", "leave_data") or []:
+        kind = entry.get("leave_type") or {}
+        if not (kind.get("leave_type_id") and kind.get("name")):
+            continue
+        config = entry.get("configuration") or {}
+        applying = config.get("applying_leave") or {}
+        approval = config.get("leave_approval") or {}
+        types.append({
+            "id": str(kind["leave_type_id"]),
+            "name": kind["name"],
+            "balance": entry.get("balance"),
+            "used": entry.get("used"),
+            "total_allocated": entry.get("total_allocated"),
+            "unit": entry.get("quota_unit", "days"),
+            "is_paid": kind.get("is_paid"),
+            "is_sick_leave": kind.get("is_sick_leave"),
+            "half_day_allowed": bool(applying.get("allow_half_day")),
+            "needs_approval": approval.get("requires_approval", True),
+            "prior_notice": prior_notice(applying.get("prior_notice_rules")),
+        })
+    return types
 
-    An entry is a dict naming its type, either directly (`leave_type_id` and a
-    name) or through a nested `leave_type` object. A matched entry is not walked
-    into: its approval chains carry other employees' {id, name} records.
-    """
-    found: dict[str, dict] = {}
 
-    def walk(node) -> None:
-        if isinstance(node, list):
-            for item in node:
-                walk(item)
-            return
-        if not isinstance(node, dict):
-            return
-        nested = node.get("leave_type") if isinstance(node.get("leave_type"), dict) else {}
-        type_id = node.get("leave_type_id") or nested.get("id")
-        name = nested.get("name") or node.get("leave_type_name") or node.get("name")
-        if type_id and name:
-            entry = {"id": str(type_id), "name": str(name)}
-            entry.update({k: v for k, v in node.items()
-                          if BALANCE_RE.search(k) and not isinstance(v, (dict, list))})
-            found.setdefault(entry["id"], entry)
-            return
-        for value in node.values():
-            walk(value)
+def upcoming_leaves(data) -> list[dict]:
+    """The employee's booked leave still ahead, from a leave-dashboard response."""
+    return [{
+        "leave_type": leave.get("leave_type_name"),
+        "start_date": leave.get("start_date"),
+        "end_date": leave.get("end_date"),
+        "days": leave.get("duration_days"),
+        "approved": leave.get("is_approved"),
+    } for leave in dashboard_part(data, "leaves", "upcoming_leaves") or []]
 
-    walk(data)
-    return list(found.values())
+
+def next_holiday(data) -> dict | None:
+    """The next company holiday, from a leave-dashboard response."""
+    holiday = dashboard_part(data, "upcoming_holidays")
+    if not isinstance(holiday, dict) or not holiday.get("date"):
+        return None
+    return {"name": holiday.get("name"), "date": holiday.get("date"),
+            "optional": holiday.get("is_optional")}
 
 
 def match_leave_type(types: list[dict], wanted: str) -> dict | None:
@@ -174,23 +201,26 @@ def match_leave_type(types: list[dict], wanted: str) -> dict | None:
     return partial[0] if len(partial) == 1 else None
 
 
-def fetch_leave_types(access_token: str) -> list[dict] | dict:
-    """The employee's leave types, or the HRMS error dict."""
-    data = hrms_request(f"{ATTENDANCE_BASE_URL}/api/leaves/dashboard", access_token)
-    if isinstance(data, dict) and data.get("error"):
-        return data
-    return leave_types(data)
+def fetch_dashboard(access_token: str) -> dict:
+    """The raw leave dashboard: leave types, upcoming leave, next holiday."""
+    return hrms_request(f"{ATTENDANCE_BASE_URL}/api/leaves/dashboard", access_token)
 
 
 @tool
 def get_leave_balance(access_token: Annotated[str, InjectedToolArg]) -> dict:
-    """Get the leave types the employee can apply for and the balance of each.
-    Use the names it returns as apply_leave's leave_type."""
-    types = fetch_leave_types(access_token)
-    if isinstance(types, dict):
-        return types
+    """Get the leave types the employee can apply for with the balance of each,
+    their leave already booked ahead, and the next company holiday. Use the
+    type names it returns as apply_leave's leave_type."""
+    data = fetch_dashboard(access_token)
+    if data.get("error"):
+        return data
     # The ids stay here: apply_leave looks them up by name itself.
-    return {"leave_types": [{k: v for k, v in t.items() if k != "id"} for t in types]}
+    return {
+        "leave_types": [{k: v for k, v in t.items() if k != "id"}
+                        for t in leave_types(data)],
+        "upcoming_leaves": upcoming_leaves(data),
+        "next_holiday": next_holiday(data),
+    }
 
 
 @tool(parse_docstring=True)
@@ -214,14 +244,19 @@ def apply_leave(
         people_to_notify: Ids of colleagues to notify, from get_team_members.
             Omit to notify nobody.
     """
-    types = fetch_leave_types(access_token)
-    if isinstance(types, dict):
-        return types
+    data = fetch_dashboard(access_token)
+    if data.get("error"):
+        return data
+    types = leave_types(data)
     match = match_leave_type(types, leave_type)
     if match is None:
         return {"error": f"No single leave type matches {leave_type!r}. "
                          "Ask the employee which one they mean.",
                 "leave_types": [t["name"] for t in types]}
+    # Caught here rather than by the HRMS, whose rejection says less.
+    if is_half_day and not match["half_day_allowed"]:
+        return {"error": f"{match['name']} cannot be taken as a half day. "
+                         "Ask the employee whether to apply for the full day."}
     body = {
         "leave_type_id": match["id"],
         "start_date": start_date,

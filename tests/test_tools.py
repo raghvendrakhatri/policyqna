@@ -1,0 +1,92 @@
+"""Parsing /api/leaves/dashboard, from a trimmed copy of a live response.
+
+Runs without Ollama, Postgres or a network.
+"""
+
+import os
+import sys
+
+sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
+
+from rag import tools  # noqa: E402
+
+
+DASHBOARD = {"error": None, "data": {
+    "employee_id": "emp",
+    "leaves": {
+        "leave_data": [
+            {
+                "leave_type": {"leave_type_id": "t-el", "name": "el-1",
+                               "is_sick_leave": False, "is_paid": True},
+                "total_allocated": 21.5, "balance": 19.5, "used": 2.0,
+                "quota_unit": "days",
+                "configuration": {
+                    "applying_leave": {
+                        "allow_half_day": False,
+                        "prior_notice_rules": [{"id": 15, "calendar_days_notice": 7,
+                                                "working_days_needed": 7,
+                                                "min_leave_days_required": 5}],
+                    },
+                    "leave_approval": {"requires_approval": True, "levels": [
+                        {"approval_assignees": [{"employee": {
+                            "employee_id": "other", "full_name": "Someone Else",
+                            "email": "someone@example.com",
+                            "date_of_birth": "2008-08-04"}}]}]},
+                },
+            },
+            {
+                # A comp-off type: no applying_leave block at all.
+                "leave_type": {"leave_type_id": "t-co", "name": "CompOff-v"},
+                "total_allocated": 0.0, "balance": 0.0, "used": 0.0,
+                "configuration": {"applying_leave": None, "leave_approval": None},
+            },
+        ],
+        "upcoming_leaves": [{"leave_type_id": "t-el", "leave_type_name": "el-1",
+                             "start_date": "2026-10-12", "end_date": "2026-10-12",
+                             "duration_days": 1.0, "is_approved": False}],
+    },
+    "upcoming_holidays": {"name": "Gandhi", "date": "2026-10-14",
+                          "description": None, "is_optional": False},
+}}
+
+
+def test_balances_come_from_the_entry_not_the_nested_type():
+    """The old walker matched the nested leave_type and lost every balance."""
+    el = tools.leave_types(DASHBOARD)[0]
+    assert (el["id"], el["name"]) == ("t-el", "el-1")
+    assert (el["balance"], el["used"], el["total_allocated"]) == (19.5, 2.0, 21.5)
+    assert el["half_day_allowed"] is False
+    assert el["prior_notice"] == ["7 calendar days' notice for 5 or more days of leave"]
+
+
+def test_a_type_without_rules_still_parses():
+    co = tools.leave_types(DASHBOARD)[1]
+    assert co["name"] == "CompOff-v"
+    assert co["half_day_allowed"] is False and co["prior_notice"] == []
+
+
+def test_approvers_never_reach_the_model():
+    assert "someone@example.com" not in str(tools.leave_types(DASHBOARD))
+
+
+def test_upcoming_leave_and_holiday():
+    assert tools.upcoming_leaves(DASHBOARD) == [{
+        "leave_type": "el-1", "start_date": "2026-10-12", "end_date": "2026-10-12",
+        "days": 1.0, "approved": False}]
+    assert tools.next_holiday(DASHBOARD) == {
+        "name": "Gandhi", "date": "2026-10-14", "optional": False}
+
+
+def test_missing_parts_are_empty():
+    assert tools.leave_types({"data": {}}) == []
+    assert tools.upcoming_leaves({}) == []
+    assert tools.next_holiday({"data": {"upcoming_holidays": None}}) is None
+
+
+def test_half_day_refused_before_submitting(monkeypatch):
+    sent = []
+    monkeypatch.setattr(tools, "fetch_dashboard", lambda token: DASHBOARD)
+    monkeypatch.setattr(tools, "hrms_request", lambda *a, **k: sent.append(a) or {})
+    result = tools.apply_leave.func("tok", "el-1", "2026-10-20", "2026-10-20",
+                                    is_half_day=True)
+    assert "half day" in result["error"] and sent == []
