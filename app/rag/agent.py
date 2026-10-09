@@ -13,7 +13,8 @@ answers in plain text. Two middlewares sit on it:
 import json
 import re
 import uuid
-from dataclasses import dataclass
+import warnings
+from dataclasses import dataclass, field
 from datetime import date, timedelta
 
 from langchain.agents import create_agent
@@ -55,9 +56,14 @@ from .guardrails import (
 )
 from .knowledge import load_knowledge
 from .models import llm
-from .tools import TOOLS, find_policy
+from .tools import SUBDOMAIN, TOOLS, find_policy
 from .ui import console, err_console, refusal_panel, waiting
 
+
+# LangGraph hands the run context to pydantic, which expects None there and
+# warns on every tool call, printing the whole context with it.
+warnings.filterwarnings("ignore", message="Pydantic serializer warnings",
+                        category=UserWarning)
 
 # Tools that change something in the HRMS. Each call is shown to the employee
 # and runs only on an explicit yes.
@@ -71,8 +77,12 @@ class HRMSContext:
     """The session, shared by every run in a chat. Reaches the middleware and
     the tools, never the messages. The login tool fills both fields in."""
 
-    access_token: str | None
+    # repr=False: a repr of the context ends up in warnings and tracebacks.
+    access_token: str | None = field(repr=False)
     profile: str = ""
+    # (email, password, subdomain) from the login confirmation, until the login
+    # tool uses them. Never in a message, so never seen by the model.
+    credentials: tuple[str, str, str] | None = field(default=None, repr=False)
 
 
 @wrap_tool_call
@@ -127,8 +137,8 @@ class Agent:
     """One chat session's agent.
 
     Every tool is always bound. Without a token the HRMS tools refuse and the
-    model is told to call `login` first, which the employee approves before the
-    browser opens. The system prompt is rebuilt on every model call from the
+    model is told to call `login` first, for which the employee types their
+    email and password at the confirmation. The system prompt is rebuilt on every model call from the
     session, so it follows a login made mid-chat.
 
     Each question runs on a fresh thread, seeded with Memory's bounded window
@@ -206,10 +216,13 @@ class Agent:
             return {"type": "reject", "message": "Already logged in."}
         if name in WRITE_TOOLS and not self.token:
             return {"type": "reject", "message": NOT_LOGGED_IN}
+        if name == "login":
+            self.context.credentials = ask_credentials()
+            if self.context.credentials:
+                return {"type": "approve"}
+            return {"type": "reject", "message": "The employee chose not to log in."}
         if confirm(name, args):
             return {"type": "approve"}
-        if name == "login":
-            return {"type": "reject", "message": "The employee chose not to log in."}
         return {"type": "reject",
                 "message": "The employee declined, so nothing was submitted."}
 
@@ -292,14 +305,31 @@ def describe(args: dict) -> str:
     return ", ".join(f"{k}={v!r}" for k, v in args.items() if k != "access_token")
 
 
+def ask_credentials() -> tuple[str, str, str] | None:
+    """The employee's HRMS email, password and subdomain, typed at the
+    terminal; None if they leave the email or password blank or press Ctrl-C.
+    The password is not echoed; a blank subdomain is HRMS_SUBDOMAIN's."""
+    console.print()
+    console.print(Panel(Text("Enter your HRMS email and password, or leave the email "
+                             "blank to cancel."),
+                        title="Log in to the HRMS", title_align="left",
+                        border_style="yellow", box=box.ROUNDED))
+    try:
+        email = console.input("[bold yellow]Email:[/bold yellow] ").strip()
+        if not email:
+            return None
+        password = console.input("[bold yellow]Password:[/bold yellow] ", password=True)
+        if not password:
+            return None
+        subdomain = console.input(
+            f"[bold yellow]Subdomain[/bold yellow] [dim]({SUBDOMAIN})[/dim]: ").strip()
+    except (EOFError, KeyboardInterrupt):
+        return None
+    return email, password, subdomain or SUBDOMAIN
+
+
 def confirm(name: str, args: dict) -> bool:
     """Show exactly what will be sent and ask. Anything but y/yes is a no."""
-    if name == "login":
-        console.print()
-        console.print(Panel(Text("Opens the HRMS login page in your browser."),
-                            title="Log in to the HRMS?", title_align="left",
-                            border_style="yellow", box=box.ROUNDED))
-        return ask_yes()
     body = Text()
     body.append(f"  action  {name}\n", style="bold")
     for key, value in args.items():

@@ -15,14 +15,16 @@ from .config import (
     MMR_FETCH_K,
     MMR_LAMBDA,
     RELEVANCE_THRESHOLD,
-    TOKEN_LOGIN,
     TOP_K,
 )
 from .db import store
-from .profile import profile_from, resolve_token
+from .profile import profile_from
 
 
 AUTH_BASE_URL = os.getenv("HRMS_AUTH_URL", "https://auth.dev2.autoscal.com")
+# The tenant the login form posts to: the subdomain of the HRMS web app. The
+# login prompt offers it as the default.
+SUBDOMAIN = os.getenv("HRMS_SUBDOMAIN", "dev1")
 ATTENDANCE_BASE_URL = os.getenv("HRMS_ATTENDANCE_URL", "https://attendence.dev2.autoscal.com")
 JOB_BASE_URL = os.getenv("HRMS_JOB_URL", "https://job.dev2.autoscal.com")
 # The HRMS rejects a request without its client id, alongside the bearer token.
@@ -33,17 +35,15 @@ ACTIVE_MEMBER_STATUSES = ["onboarded", "PreClearance", "Clearance", "InExit"]
 WFH_TYPE_ID = os.getenv("HRMS_WFH_TYPE_ID", "a44233a3-e99c-4410-b4a1-a19e63ddff48")
 
 
-def hrms_request(url: str, access_token: str, body: dict | None = None,
+def hrms_request(url: str, access_token: str | None, body: dict | None = None,
                  method: str | None = None) -> dict:
     """Call a JSON endpoint as the employee: GET, or POST when there is a body,
-    unless `method` says otherwise.
+    unless `method` says otherwise. No token sends no Authorization header.
     Errors come back as a dict rather than raising, so the model can explain
     them instead of the loop crashing."""
-    headers = {
-        "Authorization": f"Bearer {access_token}",
-        "Accept": "application/json",
-        "x-client-id": CLIENT_ID,
-    }
+    headers = {"Accept": "application/json", "x-client-id": CLIENT_ID}
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
     data = None
     if body is not None:
         data = json.dumps(body).encode("utf-8")
@@ -402,19 +402,36 @@ def search_policy(query: str) -> dict:
     return {"results": results}
 
 
+def password_login(email: str, password: str, subdomain: str = SUBDOMAIN) -> str | dict:
+    """The access token for these credentials, or the HRMS error dict."""
+    result = hrms_request(f"{AUTH_BASE_URL}/api/users/login", None, {
+        "email": email, "password": password,
+        "remember_me": True, "subdomain": subdomain,
+    })
+    token = (result.get("data") or {}).get("token") if isinstance(result, dict) else None
+    if token:
+        return token
+    return result if result.get("error") else {"error": "The HRMS returned no token",
+                                               "detail": result.get("message", "")}
+
+
 @tool
 def login(runtime: ToolRuntime) -> str:
-    """Log the employee in to the HRMS by opening its login page in their
-    browser. Call this when they ask to log in, or before any HRMS tool when
-    they are not logged in yet."""
-    try:
-        token = resolve_token(TOKEN_LOGIN)
-    except SystemExit as exc:  # the login flow exits on failure; a tool must not
-        return f"Login failed: {exc}"
+    """Log the employee in to the HRMS with their email, password and company
+    subdomain, which they type in themselves when asked to confirm. Call this when they ask to
+    log in, or before any HRMS tool when they are not logged in yet."""
+    # Typed in at the confirmation (agent.decide), kept in the run context
+    # rather than a message, and dropped as soon as they are used.
+    credentials, runtime.context.credentials = runtime.context.credentials, None
+    if not credentials:
+        return "Login cancelled: no email or password was entered."
+    token = password_login(*credentials)
+    if isinstance(token, dict):
+        return f"Login failed: {token['error']}. {token.get('detail', '')}".strip()
     # The session lives in the run context, never in a message: the model does
     # not see the token, and every later tool call in the chat picks it up.
-    details = hrms_request(f"{AUTH_BASE_URL}/api/users/me", token)
     runtime.context.access_token = token
+    details = hrms_request(f"{AUTH_BASE_URL}/api/users/me", token)
     if details.get("error"):
         return "Logged in, but the HRMS record could not be read."
     runtime.context.profile = profile_from(details)

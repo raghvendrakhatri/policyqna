@@ -340,7 +340,7 @@ AGENT_HRMS_PROMPT = """- For the employee's own data - balances, history, holida
 """
 AGENT_NO_LOGIN_PROMPT = """- The employee is NOT logged in to the HRMS yet. Before any other HRMS tool -
   applying for leave or WFH, balances, history, holidays, team, their record -
-  call the login tool. It asks them to confirm and opens the login page; once
+  call the login tool. It asks them for their email and password; once
   it succeeds, carry on with what they asked. Policy questions need no login.
 """
 

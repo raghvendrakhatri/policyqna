@@ -125,3 +125,52 @@ def test_cancel_with_no_matching_leave_sends_nothing(monkeypatch):
     result = tools.cancel_leave.func("tok", "2026-11-01")
     assert "No upcoming leave" in result["error"] and sent == []
     assert "id" not in result["upcoming_leaves"][0]
+
+
+class Context:
+    access_token = None
+    profile = ""
+    credentials = ("me@example.com", "secret", "acme")
+
+
+class Runtime:
+    def __init__(self):
+        self.context = Context()
+
+
+def test_login_posts_the_credentials_and_keeps_the_token(monkeypatch):
+    sent = []
+
+    def request(url, token, body=None, method=None):
+        sent.append((url, token, body))
+        if url.endswith("/login"):
+            return {"status": "success", "data": {"token": "tok-1"}}
+        return {"data": {"full_name": "Me"}}
+    monkeypatch.setattr(tools, "hrms_request", request)
+
+    runtime = Runtime()
+    result = tools.login.func(runtime)
+    assert sent[0] == (f"{tools.AUTH_BASE_URL}/api/users/login", None, {
+        "email": "me@example.com", "password": "secret",
+        "remember_me": True, "subdomain": "acme"})
+    assert sent[1][1] == "tok-1"
+    assert runtime.context.access_token == "tok-1"
+    assert runtime.context.credentials is None  # dropped once used
+    assert result.startswith("Logged in") and "secret" not in result
+
+
+def test_failed_login_keeps_no_session(monkeypatch):
+    monkeypatch.setattr(tools, "hrms_request", lambda *a, **k: {
+        "error": "HRMS returned 401", "detail": "Invalid credentials"})
+    runtime = Runtime()
+    result = tools.login.func(runtime)
+    assert result.startswith("Login failed: HRMS returned 401")
+    assert runtime.context.access_token is None and runtime.context.credentials is None
+
+
+def test_login_without_credentials_sends_nothing(monkeypatch):
+    sent = []
+    monkeypatch.setattr(tools, "hrms_request", lambda *a, **k: sent.append(a) or {})
+    runtime = Runtime()
+    runtime.context.credentials = None
+    assert tools.login.func(runtime).startswith("Login cancelled") and sent == []
