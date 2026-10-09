@@ -60,7 +60,7 @@ from .ui import console, err_console, refusal_panel, waiting
 
 # Tools that change something in the HRMS. Each call is shown to the employee
 # and runs only on an explicit yes.
-WRITE_TOOLS = ("apply_leave", "apply_wfh")
+WRITE_TOOLS = ("apply_leave", "cancel_leave", "apply_wfh")
 STEPS_EXHAUSTED = "I couldn't finish that within the allowed number of steps."
 NOT_LOGGED_IN = "The employee is not logged in. Call the login tool first, then retry."
 

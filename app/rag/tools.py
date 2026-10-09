@@ -33,8 +33,10 @@ ACTIVE_MEMBER_STATUSES = ["onboarded", "PreClearance", "Clearance", "InExit"]
 WFH_TYPE_ID = os.getenv("HRMS_WFH_TYPE_ID", "a44233a3-e99c-4410-b4a1-a19e63ddff48")
 
 
-def hrms_request(url: str, access_token: str, body: dict | None = None) -> dict:
-    """Call a JSON endpoint as the employee: GET, or POST when there is a body.
+def hrms_request(url: str, access_token: str, body: dict | None = None,
+                 method: str | None = None) -> dict:
+    """Call a JSON endpoint as the employee: GET, or POST when there is a body,
+    unless `method` says otherwise.
     Errors come back as a dict rather than raising, so the model can explain
     them instead of the loop crashing."""
     headers = {
@@ -46,7 +48,7 @@ def hrms_request(url: str, access_token: str, body: dict | None = None) -> dict:
     if body is not None:
         data = json.dumps(body).encode("utf-8")
         headers["Content-Type"] = "application/json"
-    request = urllib.request.Request(url, data=data, headers=headers)
+    request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(request, timeout=HRMS_TIMEOUT) as response:
             return json.load(response)
@@ -173,6 +175,7 @@ def leave_types(data) -> list[dict]:
 def upcoming_leaves(data) -> list[dict]:
     """The employee's booked leave still ahead, from a leave-dashboard response."""
     return [{
+        "id": leave.get("leave_log_id"),
         "leave_type": leave.get("leave_type_name"),
         "start_date": leave.get("start_date"),
         "end_date": leave.get("end_date"),
@@ -188,6 +191,10 @@ def next_holiday(data) -> dict | None:
         return None
     return {"name": holiday.get("name"), "date": holiday.get("date"),
             "optional": holiday.get("is_optional")}
+
+
+def without_id(entry: dict) -> dict:
+    return {k: v for k, v in entry.items() if k != "id"}
 
 
 def match_leave_type(types: list[dict], wanted: str) -> dict | None:
@@ -214,11 +221,10 @@ def get_leave_balance(access_token: Annotated[str, InjectedToolArg]) -> dict:
     data = fetch_dashboard(access_token)
     if data.get("error"):
         return data
-    # The ids stay here: apply_leave looks them up by name itself.
+    # The ids stay here: apply_leave and cancel_leave look them up themselves.
     return {
-        "leave_types": [{k: v for k, v in t.items() if k != "id"}
-                        for t in leave_types(data)],
-        "upcoming_leaves": upcoming_leaves(data),
+        "leave_types": [without_id(t) for t in leave_types(data)],
+        "upcoming_leaves": [without_id(l) for l in upcoming_leaves(data)],
         "next_holiday": next_holiday(data),
     }
 
@@ -266,6 +272,50 @@ def apply_leave(
         "attachments": [],
     }
     return hrms_request(f"{ATTENDANCE_BASE_URL}/api/leave-applications", access_token, body)
+
+
+@tool(parse_docstring=True)
+def cancel_leave(
+    access_token: Annotated[str, InjectedToolArg],
+    start_date: str,
+    leave_type: str = "",
+) -> dict:
+    """Cancel one of the employee's upcoming leave applications. Only call this
+    once they have clearly asked to cancel it.
+
+    Args:
+        start_date: First day of the leave to cancel, YYYY-MM-DD.
+        leave_type: Name of its leave type. Only needed when two leaves start
+            on the same day.
+    """
+    data = fetch_dashboard(access_token)
+    if data.get("error"):
+        return data
+    upcoming = upcoming_leaves(data)
+    found = [l for l in upcoming if l["start_date"] == start_date
+             and (not leave_type
+                  or leave_type.strip().lower() in (l["leave_type"] or "").lower())]
+    if len(found) != 1:
+        problem = "No upcoming leave" if not found else "More than one upcoming leave"
+        return {"error": f"{problem} starts on {start_date}"
+                         + (f" with type {leave_type!r}" if leave_type else "")
+                         + ". Ask the employee which one they mean.",
+                "upcoming_leaves": [without_id(l) for l in upcoming]}
+    result = hrms_request(
+        f"{ATTENDANCE_BASE_URL}/api/leave-applications/{found[0]['id']}/cancel",
+        access_token, {}, method="PUT",
+    )
+    if result.get("error"):
+        return result
+    # Only the leave itself: the response also carries the employee's record.
+    leave = result.get("data") or {}
+    return {
+        "status": leave.get("status"),
+        "leave_type": (leave.get("leave_type") or {}).get("name"),
+        "start_date": leave.get("start_date"),
+        "end_date": leave.get("end_date"),
+        "days": leave.get("duration_days"),
+    }
 
 
 @tool
@@ -380,6 +430,7 @@ TOOLS = [
     get_team_members,
     get_leave_balance,
     apply_leave,
+    cancel_leave,
     get_wfh_balance,
     get_wfh_history,
     apply_wfh,

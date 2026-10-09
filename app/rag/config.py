@@ -149,7 +149,7 @@ PERSONAL_RE = re.compile(
 # question. The agent skips the policy prefetch for these: excerpts about WFH
 # quotas per band and menstrual WFH made a 4B model ask which WFH "type" to use.
 ACTION_RE = re.compile(
-    r"\b(apply|book|request|submit|take|want)\b.*\b(leaves?|wfh|work from home)\b",
+    r"\b(apply|book|request|submit|take|want|cancel)\b.*\b(leaves?|wfh|work from home)\b",
     re.I,
 )
 
@@ -328,9 +328,12 @@ AGENT_HRMS_PROMPT = """- For the employee's own data - balances, history, holida
   Leave type names come from the HRMS, not the policy: a name such as "el-1"
   need not appear in the policy. Never reject a type name yourself - pass it to
   apply_leave, which checks it and says if it does not exist.
-- Once you have the dates, call apply_leave / apply_wfh straight away. Do not
-  ask the employee to confirm in chat: calling the tool shows them the details
-  and asks for confirmation itself. If the tool says they declined, do not
+- To cancel a leave, call cancel_leave with its start date. If the employee
+  did not say which leave, call get_leave_balance and ask them to pick one of
+  the upcoming leaves it lists.
+- Once you have the dates, call apply_leave / apply_wfh / cancel_leave
+  straight away. Do not ask the employee to confirm in chat: calling the tool
+  shows them the details and asks for confirmation itself. If the tool says they declined, do not
   retry it.
 - Never say "let me check" or "I will retrieve" - if you need a tool, call it
   in this turn.

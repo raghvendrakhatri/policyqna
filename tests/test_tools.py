@@ -42,6 +42,7 @@ DASHBOARD = {"error": None, "data": {
             },
         ],
         "upcoming_leaves": [{"leave_type_id": "t-el", "leave_type_name": "el-1",
+                             "leave_log_id": "log-1",
                              "start_date": "2026-10-12", "end_date": "2026-10-12",
                              "duration_days": 1.0, "is_approved": False}],
     },
@@ -71,7 +72,7 @@ def test_approvers_never_reach_the_model():
 
 def test_upcoming_leave_and_holiday():
     assert tools.upcoming_leaves(DASHBOARD) == [{
-        "leave_type": "el-1", "start_date": "2026-10-12", "end_date": "2026-10-12",
+        "id": "log-1", "leave_type": "el-1", "start_date": "2026-10-12", "end_date": "2026-10-12",
         "days": 1.0, "approved": False}]
     assert tools.next_holiday(DASHBOARD) == {
         "name": "Gandhi", "date": "2026-10-14", "optional": False}
@@ -90,3 +91,37 @@ def test_half_day_refused_before_submitting(monkeypatch):
     result = tools.apply_leave.func("tok", "el-1", "2026-10-20", "2026-10-20",
                                     is_half_day=True)
     assert "half day" in result["error"] and sent == []
+
+
+CANCELLED = {"error": None, "data": {
+    "leave_log_id": "log-1",
+    "employee_details": {"full_name": "Me", "date_of_birth": "2008-02-06"},
+    "leave_type": {"leave_type_id": "t-el", "name": "el-1"},
+    "start_date": "2026-10-12", "end_date": "2026-10-12", "duration_days": 1.0,
+    "status": "Cancelled",
+}}
+
+
+def test_cancel_finds_the_leave_by_date(monkeypatch):
+    sent = []
+    monkeypatch.setattr(tools, "fetch_dashboard", lambda token: DASHBOARD)
+
+    def request(url, token, body=None, method=None):
+        sent.append((url, body, method))
+        return CANCELLED
+    monkeypatch.setattr(tools, "hrms_request", request)
+
+    result = tools.cancel_leave.func("tok", "2026-10-12")
+    assert sent == [(f"{tools.ATTENDANCE_BASE_URL}/api/leave-applications/log-1/cancel",
+                     {}, "PUT")]
+    assert result == {"status": "Cancelled", "leave_type": "el-1",
+                      "start_date": "2026-10-12", "end_date": "2026-10-12", "days": 1.0}
+
+
+def test_cancel_with_no_matching_leave_sends_nothing(monkeypatch):
+    sent = []
+    monkeypatch.setattr(tools, "fetch_dashboard", lambda token: DASHBOARD)
+    monkeypatch.setattr(tools, "hrms_request", lambda *a, **k: sent.append(a) or {})
+    result = tools.cancel_leave.func("tok", "2026-11-01")
+    assert "No upcoming leave" in result["error"] and sent == []
+    assert "id" not in result["upcoming_leaves"][0]
