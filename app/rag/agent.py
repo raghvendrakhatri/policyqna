@@ -11,9 +11,10 @@ answers in plain text. Two middlewares sit on it:
 """
 
 import json
+import re
 import uuid
 from dataclasses import dataclass
-from datetime import date
+from datetime import date, timedelta
 
 from langchain.agents import create_agent
 from langchain.agents.middleware import (
@@ -175,7 +176,8 @@ class Agent:
         messages: list = []
         if self.memory is not None:
             messages += self.memory.prior_messages() + self.memory.messages()
-        messages.append(HumanMessage(content=with_policy(question) if prefetch else question))
+        content = with_policy(question) if prefetch else question
+        messages.append(HumanMessage(content=content + date_hints(question)))
         config = {
             "configurable": {"thread_id": str(uuid.uuid4())},
             # Each step is a model call or a tool round; bound it.
@@ -210,6 +212,66 @@ class Agent:
             return {"type": "reject", "message": "The employee chose not to log in."}
         return {"type": "reject",
                 "message": "The employee declined, so nothing was submitted."}
+
+
+MONTHS = {m: i for i, m in enumerate(
+    ("jan", "feb", "mar", "apr", "may", "jun", "jul", "aug", "sep", "oct", "nov", "dec"), 1)}
+WEEKDAYS = ("monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday")
+MONTH = r"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\.?"
+DAY = r"(\d{1,2})(?:st|nd|rd|th)?"
+YEAR = r"(?:,?\s+(\d{4}))?"
+DATE_RES = (
+    # 15 october, 15th oct 2026
+    (re.compile(rf"\b{DAY}\s+(?:of\s+)?{MONTH}{YEAR}\b", re.I), lambda m: (m[1], m[2], m[3])),
+    # october 15, oct 15th, 2026
+    (re.compile(rf"\b{MONTH}\s+{DAY}{YEAR}\b", re.I), lambda m: (m[2], m[1], m[3])),
+)
+ISO_RE = re.compile(r"\b\d{4}-\d{2}-\d{2}\b")
+RELATIVE_RE = re.compile(rf"\b(today|tomorrow|day after tomorrow|(?:next\s+)?(?:{'|'.join(WEEKDAYS)}))\b", re.I)
+
+
+def resolve_dates(text: str, today: date) -> list[tuple[str, date]]:
+    """The dates written in `text`, as (what was written, date).
+
+    A day and month without a year is the next such date, except that one up
+    to a month back stays in this year: "5 oct" on 9 Oct is a backdated leave,
+    not one a year away. A weekday is the next one after today.
+    """
+    found: list[tuple[str, date]] = []
+    for pattern, parts in DATE_RES:
+        for m in pattern.finditer(text):
+            day, month, year = parts(m)
+            try:
+                when = date(int(year or today.year), MONTHS[month[:3].lower()], int(day))
+            except ValueError:
+                continue  # 31 feb
+            if not year and when < today - timedelta(days=31):
+                when = when.replace(year=when.year + 1)
+            found.append((m[0], when))
+    for m in RELATIVE_RE.finditer(text):
+        word = m[1].lower()
+        if word == "today":
+            when = today
+        elif word == "tomorrow":
+            when = today + timedelta(days=1)
+        elif word == "day after tomorrow":
+            when = today + timedelta(days=2)
+        else:
+            ahead = (WEEKDAYS.index(word.split()[-1]) - today.weekday()) % 7 or 7
+            when = today + timedelta(days=ahead)
+        found.append((m[0], when))
+    return found
+
+
+def date_hints(question: str, today: date | None = None) -> str:
+    """The question's dates in YYYY-MM-DD, to append to it. A 4B model asked
+    for leave "for 15 october" replied "Which date?" rather than convert it."""
+    resolved = [(said, when) for said, when in resolve_dates(question, today or date.today())
+                if not ISO_RE.fullmatch(said)]
+    if not resolved:
+        return ""
+    lines = "\n".join(f"- {said} = {when.isoformat()} ({when:%A})" for said, when in resolved)
+    return f"\n\nDates in this message:\n{lines}"
 
 
 def with_policy(question: str) -> str:

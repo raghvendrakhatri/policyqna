@@ -314,13 +314,13 @@ Today is {today}.
 # disappears the moment the login tool succeeds.
 AGENT_HRMS_PROMPT = """- For the employee's own data - balances, history, holidays, their record -
   call the matching tool. Never guess a figure.
-- To apply for leave or WFH you need the dates; ask for anything missing
-  rather than inventing it. When you ask for a date, just ask "Which date?" -
-  never offer an example or suggested date, and only use a date the employee
-  wrote themselves. Turn "tomorrow", "next Monday" and the like into
-  YYYY-MM-DD dates using today's date. Leave and WFH are applied for future
-  dates: never refuse a date for being in the future. To notify someone, look
-  up their id with get_team_members first.
+- To apply for leave or WFH you need the dates. "15 october", "tomorrow" or
+  "next Monday" IS a date: the message lists it as YYYY-MM-DD under "Dates in
+  this message" - use that. A single date means a one-day leave, so start and
+  end are the same. Only when the employee gave no date at all, ask them for
+  it, without suggesting one. Leave and WFH are applied for future dates:
+  never refuse a date for being in the future. To notify someone, look up
+  their id with get_team_members first.
 - apply_wfh needs only the dates (and half-day or not). WFH has no type to
   choose: never ask for one and never call get_leave_balance for WFH.
 - apply_leave needs the leave type by name. If the employee did not say which,
