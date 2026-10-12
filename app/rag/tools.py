@@ -1,10 +1,13 @@
 import json
 import os
+import re
 import urllib.error
 import urllib.request
+import uuid
+from datetime import datetime, timezone
 from functools import cache
 from typing import Annotated
-from urllib.parse import urlencode
+from urllib.parse import quote, urlencode
 
 from langchain.tools import ToolRuntime
 from langchain_core.tools import InjectedToolArg, tool
@@ -33,31 +36,46 @@ CLIENT_ID = os.getenv("HRMS_CLIENT_ID", "02711038-26af-4022-8cad-d8e058bc8d89")
 ACTIVE_MEMBER_STATUSES = ["onboarded", "PreClearance", "Clearance", "InExit"]
 # The regular "Work From Home" type, the only one the HRMS offers so far.
 WFH_TYPE_ID = os.getenv("HRMS_WFH_TYPE_ID", "a44233a3-e99c-4410-b4a1-a19e63ddff48")
+# Where save_feedback_form puts downloaded feedback forms.
+FEEDBACK_DIR = os.getenv("FEEDBACK_DIR", "feedback")
 
 
-def hrms_request(url: str, access_token: str | None, body: dict | None = None,
-                 method: str | None = None) -> dict:
-    """Call a JSON endpoint as the employee: GET, or POST when there is a body,
-    unless `method` says otherwise. No token sends no Authorization header.
-    Errors come back as a dict rather than raising, so the model can explain
-    them instead of the loop crashing."""
-    headers = {"Accept": "application/json", "x-client-id": CLIENT_ID}
+def hrms_send(url: str, access_token: str | None, data: bytes | None = None,
+              content_type: str | None = None, accept: str = "application/json",
+              method: str | None = None) -> bytes | dict:
+    """The raw response body of an HRMS call as the employee, or an error dict.
+    GET, or POST when there is data, unless `method` says otherwise. No token
+    sends no Authorization header."""
+    headers = {"Accept": accept, "x-client-id": CLIENT_ID}
     if access_token:
         headers["Authorization"] = f"Bearer {access_token}"
-    data = None
-    if body is not None:
-        data = json.dumps(body).encode("utf-8")
-        headers["Content-Type"] = "application/json"
+    if content_type:
+        headers["Content-Type"] = content_type
     request = urllib.request.Request(url, data=data, headers=headers, method=method)
     try:
         with urllib.request.urlopen(request, timeout=HRMS_TIMEOUT) as response:
-            return json.load(response)
+            return response.read()
     except urllib.error.HTTPError as exc:
         detail = exc.read(500).decode("utf-8", "replace").strip()
         return {"error": f"HRMS returned {exc.code}", "detail": detail}
     except (urllib.error.URLError, OSError) as exc:
         return {"error": f"Cannot reach the HRMS: {exc}"}
-    except json.JSONDecodeError:
+
+
+def hrms_request(url: str, access_token: str | None, body: dict | None = None,
+                 method: str | None = None) -> dict:
+    """Call a JSON endpoint as the employee: GET, or POST when there is a body,
+    unless `method` says otherwise. Errors come back as a dict rather than
+    raising, so the model can explain them instead of the loop crashing."""
+    data = None if body is None else json.dumps(body).encode("utf-8")
+    raw = hrms_send(url, access_token, data,
+                    content_type=None if body is None else "application/json",
+                    method=method)
+    if isinstance(raw, dict):
+        return raw
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
         return {"error": "HRMS did not return JSON"}
 
 
@@ -366,6 +384,333 @@ def apply_wfh(
     return hrms_request(f"{ATTENDANCE_BASE_URL}/api/wfh/requests/", access_token, body)
 
 
+def local_time(stamp: str | None) -> str | None:
+    """An HRMS UTC timestamp in local time: an expiry of 18:30Z is midnight
+    in India, the next day there."""
+    if not stamp:
+        return None
+    try:
+        moment = datetime.fromisoformat(stamp.replace("Z", "+00:00"))
+    except ValueError:
+        return stamp
+    return moment.astimezone().strftime("%Y-%m-%d %H:%M")
+
+
+def feedback_request_summary(entry: dict, team_member_id: str) -> dict:
+    """One feedback request as the model needs it. The rest of the entry is
+    the form twice over and every participant's record."""
+    expiry = entry.get("expiry_date")
+    expired = False
+    if expiry:
+        try:
+            expired = datetime.fromisoformat(expiry.replace("Z", "+00:00")) \
+                < datetime.now(timezone.utc)
+        except ValueError:
+            pass
+    return {
+        "id": entry.get("id"),
+        "project": (entry.get("project") or {}).get("name"),
+        "form": (entry.get("feedback_template") or {}).get("name"),
+        "category": entry.get("category"),
+        "status": entry.get("status"),
+        "feedback_for": (entry.get("feedback_for_date") or "")[:10] or None,
+        "due": local_time(expiry),
+        "expired": expired,
+        # The employee is among the receivers too, but not on their own form.
+        "colleagues": sum(1 for r in entry.get("receivers") or []
+                          if r.get("team_member_id") != team_member_id),
+        "submissions": f"{entry.get('total_submission_count', 0)} of "
+                       f"{entry.get('total_request', 0)}",
+    }
+
+
+def fetch_feedback_requests(access_token: str) -> list[dict] | dict:
+    """The feedback requests the employee has been asked to fill, summarised,
+    or the HRMS error dict."""
+    me = hrms_request(f"{AUTH_BASE_URL}/api/users/me", access_token)
+    if me.get("error"):
+        return me
+    team_member_id = (me.get("data") or {}).get("team_member_id")
+    if not team_member_id:
+        return {"error": "The employee's HRMS record has no team member id."}
+    query = urlencode({"action": "receivedRequests", "team_member_id": team_member_id})
+    result = hrms_request(f"{JOB_BASE_URL}/api/team-feedback/requests/?{query}",
+                          access_token)
+    if result.get("error"):
+        return result
+    return [feedback_request_summary(r, team_member_id) for r in result.get("data") or []]
+
+
+def find_feedback_request(access_token: str, wanted: str) -> dict:
+    """The one request `wanted` names - by project, form name or id - or the
+    only one there is when `wanted` is empty. Otherwise an error dict that
+    lists them, so the model can ask which one.
+
+    The model names a request rather than passing its id: chat memory keeps
+    only the answers, so an id from an earlier turn is gone, and a 4B model
+    asked for "this request" made one up."""
+    requests = fetch_feedback_requests(access_token)
+    if isinstance(requests, dict):
+        return requests
+    if not requests:
+        return {"error": "The employee has no feedback requests to fill."}
+    wanted = wanted.strip().lower()
+    found = [r for r in requests if not wanted or wanted == r["id"]
+             or wanted in (r["project"] or "").lower()
+             or wanted in (r["form"] or "").lower()]
+    if len(found) == 1:
+        return found[0]
+    problem = "No feedback request matches" if not found else "More than one feedback request matches"
+    return {"error": f"{problem} {wanted!r}. Ask the employee which one they mean."
+                     if wanted else "The employee has several feedback requests. "
+                                    "Ask which one they mean.",
+            "requests": [without_id(r) for r in requests]}
+
+
+@tool
+def get_feedback_requests(access_token: Annotated[str, InjectedToolArg]) -> dict:
+    """List the team-feedback requests the employee has been asked to fill,
+    with their project, form name and due date."""
+    requests = fetch_feedback_requests(access_token)
+    if isinstance(requests, dict):
+        return requests
+    # The ids stay here: the feedback tools look them up by name themselves.
+    return {"requests": [without_id(r) for r in requests]}
+
+
+def feedback_url(request_id: str, path: str) -> str:
+    # Quoted: the id comes from the model and ends up in the path.
+    return f"{JOB_BASE_URL}/api/team-feedback/requests/{quote(request_id.strip(), safe='')}/{path}"
+
+
+def download_feedback_form(access_token: str, request_id: str) -> bytes | dict:
+    """The blank CSV form of a feedback request: one column per colleague,
+    one row per score or remark."""
+    return hrms_send(feedback_url(request_id, "export/?action=form&format=csv"),
+                     access_token, accept="text/csv")
+
+
+def parse_feedback_form(access_token: str, request_id: str, csv_bytes: bytes) -> dict:
+    """The HRMS's reading of a feedback CSV: the form template, and per
+    colleague the form with each filled cell as a field's `value`. The HRMS
+    does not check the scores' range here."""
+    boundary = uuid.uuid4().hex
+    body = (f"--{boundary}\r\n"
+            f'Content-Disposition: form-data; name="file"; filename="feedback-{request_id}.csv"\r\n'
+            "Content-Type: text/csv\r\n\r\n").encode() \
+        + csv_bytes + f"\r\n--{boundary}--\r\n".encode()
+    raw = hrms_send(feedback_url(request_id, "parse-excel/"), access_token, body,
+                    content_type=f"multipart/form-data; boundary={boundary}")
+    if isinstance(raw, dict):
+        return raw
+    try:
+        return json.loads(raw)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return {"error": "HRMS did not return JSON"}
+
+
+def by_order(node: dict) -> list[tuple[str, dict]]:
+    """A form node's children, in the order the form shows them."""
+    return sorted(((k, v) for k, v in node.items() if isinstance(v, dict)),
+                  key=lambda kv: kv[1].get("order", 0))
+
+
+def feedback_outline(form_fields: dict) -> list[dict]:
+    """The form's sections in order, each with the aspects scored in it. A
+    top-level field such as Kudos is a section of its own with no aspects."""
+    sections = []
+    for key, node in by_order(form_fields):
+        if node.get("isField"):
+            sections.append({"name": node.get("label", key), "free_text": True})
+            continue
+        aspects, section_remarks = [], False
+        for child_key, child in by_order(node.get("child") or {}):
+            if child.get("isField"):  # the one remark for the whole section
+                section_remarks = True
+                continue
+            score = (child.get("child") or {}).get("score") or {}
+            aspects.append({
+                "name": child.get("label", child_key),
+                "description": child.get("description"),
+                "score_range": [score.get("minValue"), score.get("maxValue")],
+                # The scores the form asks a remark for.
+                "remarks_for_scores": score.get("remarksCheckpoint") or [],
+            })
+        sections.append({"name": node.get("label", key), "aspects": aspects,
+                         "section_remarks": section_remarks})
+    return sections
+
+
+def has_value(node) -> bool:
+    """Whether any field under a form node has an answer filled in."""
+    if not isinstance(node, dict):
+        return False
+    if node.get("value") not in (None, ""):
+        return True
+    return any(has_value(v) for v in node.values())
+
+
+def feedback_colleagues(receivers) -> list[dict]:
+    """Who the form is about, by name and email. The rest of each entry is the
+    whole form again and profile-picture links."""
+    colleagues = []
+    for entry in receivers or []:
+        person = entry.get("receiver") or {}
+        colleague = {
+            "name": " ".join(filter(None, [person.get("firstName"), person.get("lastName")])),
+            "email": person.get("email"),
+        }
+        if entry.get("isEditable") is False:
+            colleague["editable"] = False
+        if has_value(entry.get("formFields")):
+            colleague["has_answers"] = True
+        colleagues.append(colleague)
+    return colleagues
+
+
+@tool(parse_docstring=True)
+def get_feedback_form(
+    access_token: Annotated[str, InjectedToolArg],
+    request: str = "",
+) -> dict:
+    """Get a team-feedback form the employee has to fill: the colleagues they
+    give feedback to, and the sections and aspects each colleague is scored on.
+
+    Args:
+        request: Project or form name of the feedback request, as
+            get_feedback_requests lists it. Empty when the employee has only one.
+    """
+    found = find_feedback_request(access_token, request)
+    if found.get("error"):
+        return found
+    form = download_feedback_form(access_token, found["id"])
+    if isinstance(form, dict):
+        return form
+    parsed = parse_feedback_form(access_token, found["id"], form)
+    if parsed.get("error"):
+        return parsed
+    data = parsed.get("data") or {}
+    template = (data.get("feedbackTemplate") or {}).get("form_fields") or {}
+    result: dict = {
+        "request": without_id(found),
+        "colleagues": feedback_colleagues(data.get("receivers")),
+        "sections": feedback_outline(template),
+    }
+    # unmatchedEmails / missingFields: only worth showing when there are some.
+    problems = {k: v for k, v in (data.get("errors") or {}).items() if v}
+    if problems:
+        result["problems"] = problems
+    return result
+
+
+def slug(text: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", text.lower()).strip("-") or "feedback"
+
+
+@tool(parse_docstring=True)
+def save_feedback_form(
+    access_token: Annotated[str, InjectedToolArg],
+    request: str = "",
+) -> dict:
+    """Download a team-feedback form as a CSV file the employee can fill in,
+    and say where it was saved.
+
+    Args:
+        request: Project or form name of the feedback request, as
+            get_feedback_requests lists it. Empty when the employee has only one.
+    """
+    found = find_feedback_request(access_token, request)
+    if found.get("error"):
+        return found
+    form = download_feedback_form(access_token, found["id"])
+    if isinstance(form, dict):
+        return form
+    os.makedirs(FEEDBACK_DIR, exist_ok=True)
+    # Stamped, so a second download never overwrites a form being filled in.
+    name = f"{slug(found['form'] or '')}_{slug(found['project'] or '')}_" \
+           f"{datetime.now():%Y%m%d_%H%M%S}.csv"
+    path = os.path.join(FEEDBACK_DIR, name)
+    with open(path, "wb") as fh:
+        fh.write(form)
+    return {"saved_to": os.path.abspath(path), "request": without_id(found),
+            "fill_with": f"python -m app.rag feedback {path}"}
+
+
+def feedback_files() -> list[str]:
+    """The CSV files in the feedback folder, newest first."""
+    if not os.path.isdir(FEEDBACK_DIR):
+        return []
+    names = [n for n in os.listdir(FEEDBACK_DIR) if n.lower().endswith(".csv")]
+    return sorted(names, key=lambda n: os.path.getmtime(os.path.join(FEEDBACK_DIR, n)),
+                  reverse=True)
+
+
+def find_feedback_file(wanted: str) -> str | dict:
+    """The path of the one feedback CSV named `wanted`, or the only one whose
+    name contains it. Only the base name counts, so the model cannot point the
+    upload at a file outside the feedback folder."""
+    files = feedback_files()
+    if not files:
+        return {"error": f"No feedback CSV files in {os.path.abspath(FEEDBACK_DIR)}."}
+    name = os.path.basename(wanted.strip())
+    found = [n for n in files if n == name] \
+        or [n for n in files if name and name.lower() in n.lower()]
+    if len(found) == 1:
+        return os.path.join(FEEDBACK_DIR, found[0])
+    problem = "No feedback file matches" if not found else "More than one feedback file matches"
+    return {"error": f"{problem} {wanted!r}. Ask the employee to pick one of these.",
+            "files": files}
+
+
+@tool
+def list_feedback_files() -> dict:
+    """List the feedback CSV files in the feedback folder, newest first, so the
+    employee can pick the one to upload. Filled-in forms have "_filled_" in
+    their name; the others are blank downloads."""
+    files = feedback_files()
+    if not files:
+        return {"error": f"No feedback CSV files in {os.path.abspath(FEEDBACK_DIR)}."}
+    return {"folder": os.path.abspath(FEEDBACK_DIR),
+            "files": [{"file": n, "filled": "_filled_" in n} for n in files]}
+
+
+@tool(parse_docstring=True)
+def submit_feedback_form(
+    access_token: Annotated[str, InjectedToolArg],
+    file: str,
+    request: str = "",
+) -> dict:
+    """Upload a filled-in feedback CSV from the feedback folder to the HRMS.
+
+    Args:
+        file: The CSV's file name exactly as list_feedback_files returns it.
+        request: Project or form name of the feedback request, as
+            get_feedback_requests lists it. Empty when the employee has only one.
+    """
+    path = find_feedback_file(file)
+    if isinstance(path, dict):
+        return path
+    found = find_feedback_request(access_token, request)
+    if found.get("error"):
+        return found
+    with open(path, "rb") as fh:
+        csv_bytes = fh.read()
+    parsed = parse_feedback_form(access_token, found["id"], csv_bytes)
+    if parsed.get("error"):
+        return parsed
+    data = parsed.get("data") or {}
+    colleagues = feedback_colleagues(data.get("receivers"))
+    result: dict = {
+        "uploaded": os.path.basename(path),
+        "request": without_id(found),
+        "colleagues_with_answers": [c["name"] for c in colleagues if c.get("has_answers")],
+    }
+    problems = {k: v for k, v in (data.get("errors") or {}).items() if v}
+    if problems:
+        result["problems"] = problems
+    return result
+
+
 @cache
 def policy_store():
     """One PGVector connection for the session, opened on first use."""
@@ -451,4 +796,9 @@ TOOLS = [
     get_wfh_balance,
     get_wfh_history,
     apply_wfh,
+    get_feedback_requests,
+    get_feedback_form,
+    save_feedback_form,
+    list_feedback_files,
+    submit_feedback_form,
 ]

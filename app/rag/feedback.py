@@ -106,7 +106,10 @@ def parse_csv(path: str) -> tuple[list[list[str]], list[str], list[dict]]:
             last_subcat = None
         if current is None:
             continue
-        if kind.lower() == "score":
+        # The kind column is the score field's label, and a form may label it
+        # after the aspect ("Timeliness") rather than "Score".
+        if kind.lower() == "score" or (subcat and subcat != SECTION_REMARKS
+                                       and kind and kind.lower() != "remarks"):
             last_subcat = {"name": subcat, "score_row": i, "remarks_row": None}
             current["subcats"].append(last_subcat)
         elif kind.lower() == "remarks" and last_subcat is not None:

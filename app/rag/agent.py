@@ -67,7 +67,7 @@ warnings.filterwarnings("ignore", message="Pydantic serializer warnings",
 
 # Tools that change something in the HRMS. Each call is shown to the employee
 # and runs only on an explicit yes.
-WRITE_TOOLS = ("apply_leave", "cancel_leave", "apply_wfh")
+WRITE_TOOLS = ("apply_leave", "cancel_leave", "apply_wfh", "submit_feedback_form")
 STEPS_EXHAUSTED = "I couldn't finish that within the allowed number of steps."
 NOT_LOGGED_IN = "The employee is not logged in. Call the login tool first, then retry."
 
@@ -190,8 +190,10 @@ class Agent:
         messages.append(HumanMessage(content=content + date_hints(question)))
         config = {
             "configurable": {"thread_id": str(uuid.uuid4())},
-            # Each step is a model call or a tool round; bound it.
-            "recursion_limit": AGENT_MAX_STEPS * 2 + 1,
+            # A step is a model call, then the HITL after_model node, then the
+            # tool round: three graph nodes, not two. At two, a login plus
+            # three lookups ran out of steps before the model could answer.
+            "recursion_limit": AGENT_MAX_STEPS * 3 + 1,
         }
         payload: dict | Command = {"messages": messages}
         try:

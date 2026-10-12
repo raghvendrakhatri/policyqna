@@ -11,7 +11,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from .agent import Agent, ask_agent
+from .agent import STEPS_EXHAUSTED, Agent, ask_agent
 from .chain import (
     Memory,
     Provenance,
@@ -146,7 +146,10 @@ def agent_loop(agent: Agent, memory: Memory, profile: str, token: str | None,
         if not question:
             return 0
         answer = ask_agent(agent, question, profile)
-        if answer:
+        # A run that ran out of steps answered nothing. Remembered, it is the
+        # only answer in the history, and a 4B model repeats it word for word
+        # on the next questions without calling a tool.
+        if answer and answer != STEPS_EXHAUSTED:
             memory.remember(question, answer)
 
 

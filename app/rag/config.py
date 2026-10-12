@@ -149,7 +149,11 @@ PERSONAL_RE = re.compile(
 # question. The agent skips the policy prefetch for these: excerpts about WFH
 # quotas per band and menstrual WFH made a 4B model ask which WFH "type" to use.
 ACTION_RE = re.compile(
-    r"\b(apply|book|request|submit|take|want|cancel)\b.*\b(leaves?|wfh|work from home)\b",
+    r"\b(apply|book|request|submit|take|want|cancel)\b.*\b(leaves?|wfh|work from home)\b"
+    # "download the csv for this feedback form", "list colleagues to give
+    # feedback": the HRMS feedback tools. The classifier called the first out of
+    # scope, and policy excerpts made the model offer the form instead of fetching it.
+    r"|\bfeedback\b|\b(csv|colleagues?)\b",
     re.I,
 )
 
@@ -279,6 +283,8 @@ the asker's record, answer yes.
 Always in scope (answer yes):
 - requests to apply for leave or WFH, or to see leave / WFH history, balances
   or the holiday list
+- team-feedback requests and forms: listing them, the colleagues to give
+  feedback to, downloading or filling the feedback form
 - "who am I", "what is my name", "what is my role / band / designation"
 - "who is my manager", "when did I join", "what is my email"
 - "how many leaves / WFH days do I have left"
@@ -335,6 +341,17 @@ AGENT_HRMS_PROMPT = """- For the employee's own data - balances, history, holida
   straight away. Do not ask the employee to confirm in chat: calling the tool
   shows them the details and asks for confirmation itself. If the tool says they declined, do not
   retry it.
+- Team feedback: get_feedback_requests lists the employee's feedback
+  requests. For the colleagues and sections of a form, call get_feedback_form;
+  to download it as a CSV file, call save_feedback_form. Both take the
+  request's project or form name, or nothing when there is only one - never
+  an id. Call them straight away: never offer to fetch the form or ask
+  whether to proceed. Report the saved file's path exactly as returned.
+- To upload or submit a filled-in feedback form, call list_feedback_files and
+  ask the employee which file to upload, listing the names it returns. Once
+  they pick one, call submit_feedback_form with that file name exactly as
+  listed - never invent a file name. Do not ask them to confirm in chat:
+  submit_feedback_form asks for confirmation itself.
 - Never say "let me check" or "I will retrieve" - if you need a tool, call it
   in this turn.
 """
