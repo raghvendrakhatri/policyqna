@@ -4,7 +4,7 @@ import re
 import urllib.error
 import urllib.request
 import uuid
-from datetime import datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from functools import cache
 from typing import Annotated
 from urllib.parse import quote, urlencode
@@ -83,7 +83,12 @@ def hrms_request(url: str, access_token: str | None, body: dict | None = None,
 def get_user_details(access_token: Annotated[str, InjectedToolArg]) -> dict:
     """Get the logged-in employee's own HRMS record: name, email, role, band,
     manager, joining date and similar personal details."""
-    return hrms_request(f"{AUTH_BASE_URL}/api/users/me", access_token)
+    result = hrms_request(f"{AUTH_BASE_URL}/api/users/me", access_token)
+    if result.get("error"):
+        return result
+    # Pruned like the login profile: the raw record carries credentials, pay
+    # and personal data that must never reach the model.
+    return {"profile": profile_from(result)}
 
 
 @tool
@@ -215,6 +220,22 @@ def without_id(entry: dict) -> dict:
     return {k: v for k, v in entry.items() if k != "id"}
 
 
+def weekend_only(start_date: str, end_date: str) -> dict | None:
+    """An error dict when every day from start to end is a Saturday or Sunday:
+    those are weekly offs, so there is nothing to apply for. None otherwise,
+    including for dates the HRMS should reject itself."""
+    try:
+        start, end = date.fromisoformat(start_date), date.fromisoformat(end_date)
+    except ValueError:
+        return None
+    days = [start + timedelta(days=n) for n in range((end - start).days + 1)]
+    if days and all(d.weekday() >= 5 for d in days):
+        when = ", ".join(f"{d.isoformat()} ({d:%A})" for d in days)
+        return {"error": f"{when} is a weekly off, not a working day, so no leave "
+                         "or WFH is needed. Tell the employee; do not retry."}
+    return None
+
+
 def match_leave_type(types: list[dict], wanted: str) -> dict | None:
     """The one type whose name is `wanted`, or the only one containing it:
     "casual" finds "Casual Leave". None when nothing or several match."""
@@ -256,8 +277,9 @@ def apply_leave(
     is_half_day: bool = False,
     people_to_notify: list[str] | None = None,
 ) -> dict:
-    """Submit a leave application for the employee. Only call this once they
-    have clearly asked to apply and confirmed the details.
+    """Submit a leave application for the employee once they have asked to
+    apply. The employee is shown the details and confirms before it is sent.
+    Leave is for working days only, never a Saturday or Sunday.
 
     Args:
         leave_type: Name of the leave type, such as "Casual Leave", as
@@ -268,6 +290,9 @@ def apply_leave(
         people_to_notify: Ids of colleagues to notify, from get_team_members.
             Omit to notify nobody.
     """
+    weekend = weekend_only(start_date, end_date)
+    if weekend:
+        return weekend
     data = fetch_dashboard(access_token)
     if data.get("error"):
         return data
@@ -366,14 +391,18 @@ def apply_wfh(
     end_date: str,
     is_half_day: bool = False,
 ) -> dict:
-    """Submit a work-from-home request for the employee. Only call this once
-    they have clearly asked to apply and confirmed the details.
+    """Submit a work-from-home request for the employee once they have asked
+    to apply. The employee is shown the details and confirms before it is sent.
+    WFH is for working days only, never a Saturday or Sunday.
 
     Args:
         start_date: First WFH day, YYYY-MM-DD.
         end_date: Last WFH day, YYYY-MM-DD. Same as start_date for one day.
         is_half_day: True for a half-day WFH on a single date.
     """
+    weekend = weekend_only(start_date, end_date)
+    if weekend:
+        return weekend
     body = {
         "wfh_type_id": WFH_TYPE_ID,
         "start_date": start_date,

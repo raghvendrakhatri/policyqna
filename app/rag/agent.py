@@ -50,13 +50,13 @@ from .guardrails import (
     OFF_TOPIC_REFUSAL,
     UNSAFE_OUTPUT,
     check_safety,
-    check_topicality,
     clean,
     guard_input,
+    route_question,
 )
 from .knowledge import load_knowledge
 from .models import llm
-from .tools import SUBDOMAIN, TOOLS, find_policy
+from .tools import SUBDOMAIN, TOOLS, find_policy, weekend_only
 from .ui import console, err_console, refusal_panel, waiting
 
 
@@ -218,6 +218,10 @@ class Agent:
             return {"type": "reject", "message": "Already logged in."}
         if name in WRITE_TOOLS and not self.token:
             return {"type": "reject", "message": NOT_LOGGED_IN}
+        if name in ("apply_leave", "apply_wfh"):
+            weekend = weekend_only(str(args.get("start_date")), str(args.get("end_date")))
+            if weekend:
+                return {"type": "reject", "message": weekend["error"]}
         if name == "login":
             self.context.credentials = ask_credentials()
             if self.context.credentials:
@@ -365,18 +369,25 @@ def ask_agent(agent: Agent, question: str, profile: str = "") -> str:
     action = bool(ACTION_RE.search(question))
     personal = action or bool(PERSONAL_RE.search(question))
     # "yes", "tomorrow", "do it": an answer to the agent's own question. Out of
-    # context the classifier rejects it; the conversation is what makes it fit.
+    # context the classifier rejects it, and searched alone it matches nothing.
     reply = bool(agent.memory and agent.memory.history) and looks_like_followup(question)
-    if not (personal or reply):
-        with waiting("checking scope"):
-            on_topic = check_topicality(question)
-        if not on_topic:
+    prefetch = False
+    if not reply:
+        with waiting("checking the question"):
+            route = route_question(question)
+        if route == "no" and not personal:
             console.print()
             console.print(refusal_panel(OFF_TOPIC_REFUSAL, title="Out of scope"))
             return OFF_TOPIC_REFUSAL
-    # An action needs the HRMS tools, not policy text: the excerpts only give
-    # the model things to ask about. It can still call search_policy itself.
-    answer = agent.run(question, prefetch=not (reply or action))
+        # The policy is searched only for a policy question. Excerpts in front
+        # of an HRMS request only give the model things to ask about - WFH
+        # quotas per band made it ask which WFH "type" to apply for. It can
+        # still call search_policy itself. A personal question the classifier
+        # rejected is searched, as every question was before routing. An
+        # action with a date ("apply wfh for 5 oct") is never searched, however
+        # it is routed; without one ("how many leaves can I take") the route decides.
+        prefetch = route != "hrms" and not (action and date_hints(question))
+    answer = agent.run(question, prefetch=prefetch)
     unsafe = check_safety(answer, "ai") if answer else None
     if unsafe:
         err_console.print(f"[red]Output flagged unsafe: {unsafe}[/red]")

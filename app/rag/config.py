@@ -49,7 +49,7 @@ _REPO_DIR = os.path.dirname(_PKG_DIR)                  # repo root
 KNOWLEDGE_DIR = os.path.join(_REPO_DIR, "knowledge")
 KNOWLEDGE_SUFFIXES = (".md", ".txt")
 KNOWLEDGE_SKIP = {"readme.md", "readme.txt"}  # notes about the folder, not facts
-KNOWLEDGE_WARN_CHARS = 6000
+KNOWLEDGE_WARN_CHARS = 7000
 
 # Who is asking. The profile comes from the HRMS, keyed by the employee's own
 # access token - nothing about an employee is stored in this repo. PROFILE_DIR is
@@ -146,8 +146,9 @@ PERSONAL_RE = re.compile(
 )
 
 # "apply wfh for 5 oct", "book leave tomorrow": a request to act, not a policy
-# question. The agent skips the policy prefetch for these: excerpts about WFH
-# quotas per band and menstrual WFH made a 4B model ask which WFH "type" to use.
+# question. The agent never refuses these as off-topic, and skips the policy
+# prefetch for one that names a date: excerpts about WFH quotas per band and
+# menstrual WFH made a 4B model ask which WFH "type" to use.
 ACTION_RE = re.compile(
     r"\b(apply|book|request|submit|take|want|cancel)\b.*\b(leaves?|wfh|work from home)\b"
     # "download the csv for this feedback form", "list colleagues to give
@@ -291,13 +292,63 @@ Always in scope (answer yes):
 - any question using "my", "I", "me" about work, role, HR, pay, or benefits."""
 
 
+# Agent mode's version of TOPICALITY_PROMPT: one call that both rejects
+# off-topic questions and decides whether the policy is searched before the
+# model sees the question. Searching on every question put WFH and leave
+# excerpts in front of "who am I" and "list my feedback requests".
+ROUTE_PROMPT = """You are a classifier for a company HR assistant. Reply with exactly one
+word: hrms, policy or no.
+
+hrms - ONLY when the question is one of these, which are answered from the
+  asker's live HRMS record or done in the HRMS:
+  - their remaining balance, or their leave or WFH history ("how many leaves
+    do I have left", "my upcoming leaves")
+  - the holiday list
+  - their own details: name, role, band, manager, email, joining date
+  - logging in
+  - applying for or cancelling leave or WFH ("apply wfh for 5 oct")
+  - team-feedback requests and forms: listing, downloading, uploading
+
+policy - any other question about the company: what the policy, handbook or
+  rules say, even when it mentions "I" or "my". Entitlements, eligibility,
+  carry forward, encashment, notice periods, allowances, reimbursement,
+  appraisal, conduct, how a process works.
+
+no - not about the company at all: general knowledge, coding, trivia,
+  chit-chat.
+
+Example
+  in:  how many casual leaves do I have left?
+  out: hrms
+
+Example
+  in:  how many leaves can I take in a year?
+  out: policy
+
+Example
+  in:  can I carry forward my earned leave?
+  out: policy
+
+Example
+  in:  what is my daily food allowance in Pune?
+  out: policy
+
+Example
+  in:  apply wfh for tomorrow
+  out: hrms
+
+Example
+  in:  what is the capital of France?
+  out: no"""
+
+
 # Agent mode (`chat --tools`). Bounded so a model that keeps calling tools
 # cannot loop forever; tool results are capped because NUM_CTX holds them all.
 AGENT_MAX_STEPS = 5
 TOOL_RESULT_MAX_CHARS = 8000
-# Every question is searched against the policy before the model sees it, so
-# a policy answer never depends on a 4B model choosing to call search_policy.
-# Fewer chunks than TOP_K: they ride along with every question, HRMS ones too.
+# A question ROUTE_PROMPT calls a policy question is searched before the model
+# sees it, so a policy answer never depends on a 4B model choosing to call
+# search_policy. Fewer chunks than TOP_K: they ride along with the question.
 AGENT_PREFETCH_K = 5
 
 AGENT_PROMPT = """You are an HR assistant for the company. You answer questions about
@@ -327,6 +378,9 @@ AGENT_HRMS_PROMPT = """- For the employee's own data - balances, history, holida
   it, without suggesting one. Leave and WFH are applied for future dates:
   never refuse a date for being in the future. To notify someone, look up
   their id with get_team_members first.
+- Saturday and Sunday are weekly offs: never apply leave or WFH for them. The
+  dates list gives each date's weekday - if every date asked for is a Saturday
+  or Sunday, tell the employee no leave or WFH is needed instead of applying.
 - apply_wfh needs only the dates (and half-day or not). WFH has no type to
   choose: never ask for one and never call get_leave_balance for WFH.
 - apply_leave needs the leave type by name. If the employee did not say which,
@@ -336,7 +390,8 @@ AGENT_HRMS_PROMPT = """- For the employee's own data - balances, history, holida
   apply_leave, which checks it and says if it does not exist.
 - To cancel a leave, call cancel_leave with its start date. If the employee
   did not say which leave, call get_leave_balance and ask them to pick one of
-  the upcoming leaves it lists.
+  the upcoming leaves it lists. There is no tool to cancel a WFH request:
+  never use cancel_leave for one - tell the employee to cancel it in the HRMS.
 - Once you have the dates, call apply_leave / apply_wfh / cancel_leave
   straight away. Do not ask the employee to confirm in chat: calling the tool
   shows them the details and asks for confirmation itself. If the tool says they declined, do not

@@ -10,7 +10,7 @@ import sys
 
 from langchain_ollama import ChatOllama
 
-from .config import KEEP_ALIVE, TOPICALITY_PROMPT, env
+from .config import KEEP_ALIVE, ROUTE_PROMPT, TOPICALITY_PROMPT, env
 
 
 # Prompt-injection patterns. A user question should never try to reset the
@@ -112,6 +112,9 @@ def topicality_llm() -> "ChatOllama":
             temperature=0,
             keep_alive=KEEP_ALIVE,
             num_predict=4,  # "yes" / "no" and nothing more
+            # On a thinking model (qwen3) the thinking eats all four tokens and
+            # the reply comes back empty, which read as "no" to every question.
+            reasoning=False,
         )
     return _topicality_llm
 
@@ -132,6 +135,37 @@ def check_topicality(question: str) -> bool:
         return True
     verdict = clean(verdict)
     return verdict.startswith("yes")
+
+
+ROUTES = ("policy", "hrms", "no")
+
+
+def parse_route(verdict: str) -> str:
+    """The route a classifier reply names, or "policy" when it names none:
+    searching the policy needlessly costs less than missing it."""
+    word = clean(verdict).strip().lower().lstrip("*'\"` ")
+    return next((r for r in ROUTES if word.startswith(r)), "policy")
+
+
+def route_question(question: str) -> str:
+    """"policy" when the question needs the policy searched, "hrms" when it
+    needs only the HRMS tools, "no" when it is out of scope.
+
+    Fails open to "policy", which is what every question got before routing.
+    TOPICALITY_CHECK=0 turns "no" into "policy" rather than skipping the call:
+    the route still decides the search.
+    """
+    try:
+        verdict = topicality_llm().invoke(
+            [("system", ROUTE_PROMPT), ("human", question)]
+        ).content
+    except Exception as exc:  # noqa: BLE001 - a classifier failure must not block
+        print(f"Question routing skipped: {exc}", file=sys.stderr)
+        return "policy"
+    route = parse_route(verdict)
+    if route == "no" and os.getenv("TOPICALITY_CHECK", "1").lower() in ("0", "false", "no", "off"):
+        return "policy"
+    return route
 
 
 def guard_input(question: str) -> str | None:

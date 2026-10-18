@@ -6,6 +6,8 @@ Runs without Ollama, Postgres or a network.
 import os
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "app"))
 
 from rag import tools  # noqa: E402
@@ -174,3 +176,22 @@ def test_login_without_credentials_sends_nothing(monkeypatch):
     runtime = Runtime()
     runtime.context.credentials = None
     assert tools.login.func(runtime).startswith("Login cancelled") and sent == []
+
+
+def test_weekend_only_dates_are_turned_back():
+    assert tools.weekend_only("2026-10-17", "2026-10-17")["error"].startswith(
+        "2026-10-17 (Saturday) is a weekly off")
+    assert tools.weekend_only("2026-10-17", "2026-10-18") is not None  # Sat-Sun
+
+
+def test_a_weekday_or_a_range_across_a_weekend_goes_through():
+    assert tools.weekend_only("2026-10-16", "2026-10-16") is None  # Friday
+    assert tools.weekend_only("2026-10-16", "2026-10-19") is None  # Fri-Mon
+    assert tools.weekend_only("not a date", "2026-10-18") is None  # the HRMS's call
+
+
+def test_apply_wfh_refuses_a_weekend_without_calling_the_hrms(monkeypatch):
+    monkeypatch.setattr(tools, "hrms_request",
+                        lambda *a, **k: pytest.fail("the HRMS was called"))
+    result = tools.apply_wfh.func("token", "2026-10-18", "2026-10-18")
+    assert "weekly off" in result["error"]
