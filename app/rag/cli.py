@@ -184,8 +184,9 @@ def cmd_stats() -> int:
     return 0
 
 
-def cmd_check() -> int:
-    """Health check: can we reach Postgres and Ollama, and are the models pulled?"""
+def health() -> list[tuple[str, str]]:
+    """Can we reach Postgres and Ollama, and are the models pulled? Each line is
+    ("ok" | "warn" | "fail", message); a "fail" ends the check there."""
     try:
         with psycopg.connect(
             dbname=os.getenv("POSTGRES_DB"),
@@ -199,9 +200,8 @@ def cmd_check() -> int:
                 cur.execute("SELECT version()")
                 version = cur.fetchone()[0]
     except psycopg.Error as exc:
-        print(f"Database ping failed: {exc}", file=sys.stderr)
-        return 1
-    print(f"Database OK: {version}")
+        return [("fail", f"Database ping failed: {exc}")]
+    lines = [("ok", f"Database OK: {version}")]
 
     import urllib.error
     import urllib.request
@@ -211,15 +211,22 @@ def cmd_check() -> int:
         with urllib.request.urlopen(f"{base_url}/api/tags", timeout=5) as response:
             models = [m["name"] for m in json.load(response).get("models", [])]
     except (urllib.error.URLError, OSError) as exc:
-        print(f"Ollama ping failed at {base_url}: {exc}", file=sys.stderr)
-        return 1
-    print(f"Ollama OK at {base_url}: {len(models)} model(s) available")
+        return lines + [("fail", f"Ollama ping failed at {base_url}: {exc}")]
+    lines.append(("ok", f"Ollama OK at {base_url}: {len(models)} model(s) available"))
 
     for var in ("CHAT_MODEL", "EMBED_MODEL"):
         name = os.getenv(var)
         if name and name not in models:
-            print(f"Warning: {var}={name} is not pulled. `ollama pull {name}`", file=sys.stderr)
-    return 0
+            lines.append(("warn", f"Warning: {var}={name} is not pulled. `ollama pull {name}`"))
+    return lines
+
+
+def cmd_check() -> int:
+    """Health check: can we reach Postgres and Ollama, and are the models pulled?"""
+    lines = health()
+    for level, message in lines:
+        print(message, file=sys.stdout if level == "ok" else sys.stderr)
+    return 1 if lines[-1][0] == "fail" else 0
 
 
 def cmd_reset() -> int:
@@ -426,6 +433,11 @@ def parse_args() -> argparse.Namespace:
     p = sub.add_parser("profile", help="show what the HRMS returns about you")
     add_profile_args(p)
 
+    p = sub.add_parser("web", help="serve the web UI")
+    p.add_argument("--host", default="127.0.0.1",
+                   help="interface to bind (default 127.0.0.1: this machine only)")
+    p.add_argument("--port", type=int, default=8000)
+
     sub.add_parser("stats", help="show what is indexed")
     sub.add_parser("reset", help="drop the collection")
     return parser.parse_args()
@@ -460,6 +472,10 @@ def main() -> int:
             return cmd_profile(chosen_token(args), args.profile)
         if args.command == "stats":
             return cmd_stats()
+        if args.command == "web":
+            from .web import serve
+
+            return serve(args.host, args.port)
         return cmd_reset()
     except psycopg.OperationalError as exc:
         sys.exit(f"Cannot reach Postgres: {exc}\nIs it up? `docker compose up -d postgres`")

@@ -47,6 +47,8 @@ COLLECTION = "policies"
 _PKG_DIR = os.path.dirname(os.path.dirname(__file__))  # .../app
 _REPO_DIR = os.path.dirname(_PKG_DIR)                  # repo root
 KNOWLEDGE_DIR = os.path.join(_REPO_DIR, "knowledge")
+# Documents to ingest. The web UI only ingests files from here.
+DATA_DIR = os.path.join(_REPO_DIR, "data")
 KNOWLEDGE_SUFFIXES = (".md", ".txt")
 KNOWLEDGE_SKIP = {"readme.md", "readme.txt"}  # notes about the folder, not facts
 KNOWLEDGE_WARN_CHARS = 7000

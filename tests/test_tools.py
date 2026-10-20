@@ -4,6 +4,7 @@ Runs without Ollama, Postgres or a network.
 """
 
 import os
+from datetime import date
 import sys
 
 import pytest
@@ -195,3 +196,25 @@ def test_apply_wfh_refuses_a_weekend_without_calling_the_hrms(monkeypatch):
                         lambda *a, **k: pytest.fail("the HRMS was called"))
     result = tools.apply_wfh.func("token", "2026-10-18", "2026-10-18")
     assert "weekly off" in result["error"]
+
+
+HOLIDAYS = {"error": None, "data": [
+    {"name": "Independence Day", "date": "2026-08-15", "is_optional": False, "is_active": True},
+    {"name": "Republic Day", "date": "2027-01-26", "is_optional": False, "is_active": True},
+    {"name": "Testijng", "date": "2026-10-23", "is_optional": True, "is_active": True},
+    {"name": "shubhamtest", "date": "2026-11-20", "is_optional": False, "is_active": True},
+    {"name": "Diwali", "date": "2026-11-08", "is_optional": False, "is_active": True},
+    {"name": "Old", "date": "2026-12-01", "is_optional": False, "is_active": False},
+]}
+
+
+def test_holidays_are_upcoming_real_and_in_order():
+    assert tools.holiday_list(HOLIDAYS, date(2026, 10, 19)) == [
+        {"name": "Diwali", "date": "2026-11-08", "weekday": "Sunday", "optional": False},
+        {"name": "Republic Day", "date": "2027-01-26", "weekday": "Tuesday", "optional": False},
+    ]
+
+
+def test_past_holidays_only_when_asked():
+    names = [h["name"] for h in tools.holiday_list(HOLIDAYS, date(2026, 10, 19), include_past=True)]
+    assert names == ["Independence Day", "Diwali", "Republic Day"]

@@ -230,7 +230,28 @@ uv run python app/main.py ask -k 15 "what is the notice period?"
 Raising `-k` stuffs more text into the prompt. If you push it far, raise
 `NUM_CTX` in `.env` to match, or the model will silently drop the overflow.
 
-### 5.5 Running in Docker
+### 5.5 Web UI
+
+The same assistant in a browser, plus buttons for the HRMS actions and the
+admin commands:
+
+```bash
+uv run python app/main.py web          # http://127.0.0.1:8000
+```
+
+- **Chat**: the tool-using assistant, or "policy only" for `ask`-style answers
+  with sources. Logins and writes (apply/cancel leave, WFH, feedback upload)
+  pause on a card you approve or reject, as the CLI's confirmation does.
+- **HRMS actions**: balances, history, holidays, colleagues, feedback requests,
+  and forms to apply leave, apply WFH and cancel leave, without the model.
+- **Admin**: `check`, `stats`, `ingest` (files in `data/` only), `reset`, `pa`.
+
+It binds to 127.0.0.1 by default; sessions live in RAM, so a restart logs
+everyone out. `discover` and the interactive `feedback` filler stay CLI-only.
+Answers are rendered without links or images, so a reply cannot make the
+browser fetch a URL.
+
+### 5.6 Running in Docker
 
 The `app` service is wired to reach Ollama on the host via
 `host.docker.internal`, so keep `ollama serve` running outside the container:
@@ -341,6 +362,7 @@ Nothing matched in the vector store and no profile/knowledge was configured, so
 | `profile` | Show what the HRMS returns and how much of `NUM_CTX` it uses | same profile flags |
 | `pa <path>` | Compute a PA score from a JSON file | — |
 | `stats` | Show what is indexed, plus knowledge files | — |
+| `web` | Serve the web UI | `--host` (default 127.0.0.1), `--port` (default 8000) |
 | `reset` | Drop the collection | — |
 
 `ask` and `chat` also take `--no-sources` to leave off the trailing `Sources:`

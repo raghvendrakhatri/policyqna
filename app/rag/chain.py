@@ -6,6 +6,7 @@ the boundary between the chain and the CLI.
 """
 
 import re
+from dataclasses import dataclass
 
 from langchain_core.documents import Document
 from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
@@ -373,14 +374,23 @@ def credit(answer: str, provenance: "Provenance") -> str:
     return " - ".join(parts)
 
 
-def ask(chain, question: str, provenance: "Provenance | None" = None,
-        profile: str = "") -> str:
+@dataclass
+class Reply:
+    """One answer, before it is shown. `refused` names the panel title when the
+    question or the answer was turned back; `sources` is empty if uncredited."""
+
+    text: str
+    refused: str | None = None
+    sources: str = ""
+
+
+def answer(chain, question: str, provenance: "Provenance | None" = None,
+           profile: str = "") -> Reply:
+    """The guardrails and the chain, with nothing printed: the CLI and the web
+    UI each show the Reply their own way."""
     refusal = guard_input(question)
     if refusal:
-        console.print()
-        console.print(refusal_panel(refusal))
-        console.print()
-        return refusal
+        return Reply(refusal, refused="Refused")
     # Topicality classifier: catches off-topic questions ("capital of France",
     # "write me Python code") that score low on retrieval but may spuriously
     # match a chunk. One short LLM call on the already-resident chat model.
@@ -394,42 +404,43 @@ def ask(chain, question: str, provenance: "Provenance | None" = None,
         with waiting("checking scope"):
             on_topic = check_topicality(question)
     if not on_topic:
-        console.print()
-        console.print(refusal_panel(OFF_TOPIC_REFUSAL, title="Out of scope"))
-        console.print()
-        return OFF_TOPIC_REFUSAL
+        return Reply(OFF_TOPIC_REFUSAL, refused="Out of scope")
     try:
         with waiting("thinking"):
-            answer = chain.invoke(question)
+            raw = chain.invoke(question)
     except NoContext:
-        console.print()
-        console.print(refusal_panel(OFF_TOPIC_REFUSAL, title="No matching policy"))
-        console.print()
-        return OFF_TOPIC_REFUSAL
-    cleaned = clean(answer)
+        return Reply(OFF_TOPIC_REFUSAL, refused="No matching policy")
+    cleaned = clean(raw)
     unsafe = check_safety(cleaned, "ai") if cleaned else None
     if unsafe:
         err_console.print(f"[red]Output flagged unsafe: {unsafe}[/red]")
-        console.print()
-        console.print(refusal_panel(UNSAFE_OUTPUT, title="Unsafe output"))
-        console.print()
-        return UNSAFE_OUTPUT
+        return Reply(UNSAFE_OUTPUT, refused="Unsafe output")
+    sources = credit(cleaned, provenance) if provenance is not None and cleaned else ""
+    return Reply(cleaned, sources=sources)
+
+
+def ask(chain, question: str, provenance: "Provenance | None" = None,
+        profile: str = "") -> str:
+    reply = answer(chain, question, provenance, profile)
     console.print()
-    if cleaned:
-        console.print(Panel(Markdown(cleaned), border_style="cyan", box=box.ROUNDED,
+    if reply.refused:
+        console.print(refusal_panel(reply.text, title=reply.refused))
+        console.print()
+        return reply.text
+    if reply.text:
+        console.print(Panel(Markdown(reply.text), border_style="cyan", box=box.ROUNDED,
                             title="Answer", title_align="left"))
     else:
         console.print(Panel(Text("(empty answer)", style="dim italic"),
                             border_style="dim", box=box.ROUNDED))
     console.print()
-    if provenance is not None and cleaned:
-        sources = credit(cleaned, provenance)
-        if sources:
-            console.print(f"[green]Sources[/green] [dim]·[/dim] {sources}\n")
+    if provenance is not None and reply.text:
+        if reply.sources:
+            console.print(f"[green]Sources[/green] [dim]·[/dim] {reply.sources}\n")
         else:
             # Grounding guardrail: credit() couldn't tie the answer to any
             # retrieved chunk, knowledge file or profile field. Say so rather
             # than silently ship an unsourced answer.
             err_console.print("[yellow]! answer could not be tied to any indexed"
                               " source[/yellow]")
-    return cleaned
+    return reply.text

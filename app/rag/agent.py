@@ -70,6 +70,8 @@ warnings.filterwarnings("ignore", message="Pydantic serializer warnings",
 WRITE_TOOLS = ("apply_leave", "cancel_leave", "apply_wfh", "submit_feedback_form")
 STEPS_EXHAUSTED = "I couldn't finish that within the allowed number of steps."
 NOT_LOGGED_IN = "The employee is not logged in. Call the login tool first, then retry."
+LOGIN_DECLINED = "The employee chose not to log in."
+WRITE_DECLINED = "The employee declined, so nothing was submitted."
 
 
 @dataclass
@@ -183,6 +185,21 @@ class Agent:
         """`prefetch=False` for a reply to the agent's own question ("el-1",
         "yes"): searched alone it matches policy text that says nothing about
         it, and the model reads that as the answer being wrong."""
+        payload, config = self.begin(question, prefetch)
+        try:
+            while True:
+                state = self.step(payload, config)
+                requests = pending(state)
+                if not requests:
+                    break
+                decisions = [self.decide(r["name"], r["args"]) for r in requests]
+                payload = Command(resume={"decisions": decisions})
+        except GraphRecursionError:
+            return STEPS_EXHAUSTED
+        return clean(state["messages"][-1].content)
+
+    def begin(self, question: str, prefetch: bool = True) -> tuple[dict, dict]:
+        """The first payload and the config for one question, on a fresh thread."""
         messages: list = []
         if self.memory is not None:
             messages += self.memory.prior_messages() + self.memory.messages()
@@ -195,25 +212,18 @@ class Agent:
             # three lookups ran out of steps before the model could answer.
             "recursion_limit": AGENT_MAX_STEPS * 3 + 1,
         }
-        payload: dict | Command = {"messages": messages}
-        try:
-            while True:
-                with waiting("thinking"):
-                    state = self.graph.invoke(payload, config, context=self.context)
-                interrupts = state.get("__interrupt__")
-                if not interrupts:
-                    break
-                # One interrupt per model turn, holding every write call it made.
-                requests = interrupts[0].value["action_requests"]
-                decisions = [self.decide(r["name"], r["args"]) for r in requests]
-                payload = Command(resume={"decisions": decisions})
-        except GraphRecursionError:
-            return STEPS_EXHAUSTED
-        return clean(state["messages"][-1].content)
+        return {"messages": messages}, config
 
-    def decide(self, name: str, args: dict) -> dict:
-        """The employee's answer to one paused call. A write with no session is
-        turned back without asking: confirming it would only end in an error."""
+    def step(self, payload: dict | Command, config: dict) -> dict:
+        """Run until the answer or the next paused write. Raises
+        GraphRecursionError when the steps run out."""
+        with waiting("thinking"):
+            return self.graph.invoke(payload, config, context=self.context)
+
+    def auto_decision(self, name: str, args: dict) -> dict | None:
+        """A paused call that needs no asking, decided here; None to ask. A
+        write with no session is turned back: confirming it would only end in
+        an error."""
         if name == "login" and self.token:
             return {"type": "reject", "message": "Already logged in."}
         if name in WRITE_TOOLS and not self.token:
@@ -222,15 +232,28 @@ class Agent:
             weekend = weekend_only(str(args.get("start_date")), str(args.get("end_date")))
             if weekend:
                 return {"type": "reject", "message": weekend["error"]}
+        return None
+
+    def decide(self, name: str, args: dict) -> dict:
+        """The employee's answer to one paused call, asked at the terminal."""
+        automatic = self.auto_decision(name, args)
+        if automatic:
+            return automatic
         if name == "login":
             self.context.credentials = ask_credentials()
             if self.context.credentials:
                 return {"type": "approve"}
-            return {"type": "reject", "message": "The employee chose not to log in."}
+            return {"type": "reject", "message": LOGIN_DECLINED}
         if confirm(name, args):
             return {"type": "approve"}
-        return {"type": "reject",
-                "message": "The employee declined, so nothing was submitted."}
+        return {"type": "reject", "message": WRITE_DECLINED}
+
+
+def pending(state: dict) -> list[dict]:
+    """The write calls a run paused on, each {"name", "args"}; empty when it
+    finished. One interrupt per model turn, holding every write call it made."""
+    interrupts = state.get("__interrupt__")
+    return interrupts[0].value["action_requests"] if interrupts else []
 
 
 MONTHS = {m: i for i, m in enumerate(
@@ -357,13 +380,12 @@ def ask_yes() -> bool:
     return answer.strip().lower() in ("y", "yes")
 
 
-def ask_agent(agent: Agent, question: str, profile: str = "") -> str:
-    """The agent-mode counterpart of chain.ask: same guardrails, same panels."""
+def screen(agent: Agent, question: str) -> tuple[str | None, str, bool]:
+    """Guardrails and routing before the agent runs: (refusal, panel title,
+    prefetch). `refusal` is None when the question goes ahead."""
     refusal = guard_input(question)
     if refusal:
-        console.print()
-        console.print(refusal_panel(refusal))
-        return refusal
+        return refusal, "Refused", False
     # "apply wfh for me", "my balance": about the employee, so in scope. Without
     # a login the agent itself says so, which beats an "out of scope" refusal.
     action = bool(ACTION_RE.search(question))
@@ -371,29 +393,44 @@ def ask_agent(agent: Agent, question: str, profile: str = "") -> str:
     # "yes", "tomorrow", "do it": an answer to the agent's own question. Out of
     # context the classifier rejects it, and searched alone it matches nothing.
     reply = bool(agent.memory and agent.memory.history) and looks_like_followup(question)
-    prefetch = False
-    if not reply:
-        with waiting("checking the question"):
-            route = route_question(question)
-        if route == "no" and not personal:
-            console.print()
-            console.print(refusal_panel(OFF_TOPIC_REFUSAL, title="Out of scope"))
-            return OFF_TOPIC_REFUSAL
-        # The policy is searched only for a policy question. Excerpts in front
-        # of an HRMS request only give the model things to ask about - WFH
-        # quotas per band made it ask which WFH "type" to apply for. It can
-        # still call search_policy itself. A personal question the classifier
-        # rejected is searched, as every question was before routing. An
-        # action with a date ("apply wfh for 5 oct") is never searched, however
-        # it is routed; without one ("how many leaves can I take") the route decides.
-        prefetch = route != "hrms" and not (action and date_hints(question))
-    answer = agent.run(question, prefetch=prefetch)
+    if reply:
+        return None, "", False
+    with waiting("checking the question"):
+        route = route_question(question)
+    if route == "no" and not personal:
+        return OFF_TOPIC_REFUSAL, "Out of scope", False
+    # The policy is searched only for a policy question. Excerpts in front
+    # of an HRMS request only give the model things to ask about - WFH
+    # quotas per band made it ask which WFH "type" to apply for. It can
+    # still call search_policy itself. A personal question the classifier
+    # rejected is searched, as every question was before routing. An
+    # action with a date ("apply wfh for 5 oct") is never searched, however
+    # it is routed; without one ("how many leaves can I take") the route decides.
+    return None, "", route != "hrms" and not (action and date_hints(question))
+
+
+def checked(answer: str) -> str | None:
+    """None when the answer is safe to show, else the refusal to show instead."""
     unsafe = check_safety(answer, "ai") if answer else None
     if unsafe:
         err_console.print(f"[red]Output flagged unsafe: {unsafe}[/red]")
-        console.print()
-        console.print(refusal_panel(UNSAFE_OUTPUT, title="Unsafe output"))
         return UNSAFE_OUTPUT
+    return None
+
+
+def ask_agent(agent: Agent, question: str, profile: str = "") -> str:
+    """The agent-mode counterpart of chain.ask: same guardrails, same panels."""
+    refusal, title, prefetch = screen(agent, question)
+    if refusal:
+        console.print()
+        console.print(refusal_panel(refusal, title=title))
+        return refusal
+    answer = agent.run(question, prefetch=prefetch)
+    unsafe = checked(answer)
+    if unsafe:
+        console.print()
+        console.print(refusal_panel(unsafe, title="Unsafe output"))
+        return unsafe
     console.print()
     if answer:
         console.print(Panel(Markdown(answer), border_style="cyan", box=box.ROUNDED,

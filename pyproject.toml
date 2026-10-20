@@ -13,6 +13,8 @@ dependencies = [
     "langchain-postgres>=0.0.14",
     "langchain-text-splitters>=0.3",
     "rich>=13.9",
+    "fastapi>=0.143.5",
+    "uvicorn>=0.54.0",
 ]
 
 [project.optional-dependencies]

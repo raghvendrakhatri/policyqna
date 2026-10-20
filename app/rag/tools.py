@@ -91,11 +91,47 @@ def get_user_details(access_token: Annotated[str, InjectedToolArg]) -> dict:
     return {"profile": profile_from(result)}
 
 
-@tool
-def get_holidays(access_token: Annotated[str, InjectedToolArg]) -> dict:
-    """Get the company holiday list, including restricted holidays and their
-    dates."""
-    return hrms_request(f"{ATTENDANCE_BASE_URL}/api/holidays", access_token)
+def is_test_holiday(name: str) -> bool:
+    """Entries HR made to try the HRMS out: "Test Floater 1", "shubhamtest"."""
+    return "test" in name.lower()
+
+
+def holiday_list(data, today: date, include_past: bool = False) -> list[dict]:
+    """Active, real holidays from an /api/holidays response, by date: only
+    those from today on unless `include_past`."""
+    holidays = []
+    for holiday in data.get("data") or []:
+        name = (holiday.get("name") or "").strip()
+        try:
+            when = date.fromisoformat(holiday.get("date") or "")
+        except ValueError:
+            continue
+        if (not holiday.get("is_active", True) or is_test_holiday(name)
+                or (when < today and not include_past)):
+            continue
+        holidays.append({"name": name, "date": when.isoformat(),
+                         "weekday": f"{when:%A}", "optional": holiday.get("is_optional")})
+    return sorted(holidays, key=lambda h: h["date"])
+
+
+@tool(parse_docstring=True)
+def get_holidays(
+    access_token: Annotated[str, InjectedToolArg],
+    include_past: bool = False,
+) -> dict:
+    """Get the company holidays from today on, by date, with whether each is
+    optional (restricted). List them as they come back; past ones are left out.
+
+    Args:
+        include_past: Also return holidays already gone, only when the employee
+            asks about past holidays or a whole year.
+    """
+    data = hrms_request(f"{ATTENDANCE_BASE_URL}/api/holidays", access_token)
+    if data.get("error"):
+        return data
+    today = date.today()
+    return {"today": today.isoformat(),
+            "holidays": holiday_list(data, today, include_past)}
 
 
 @tool(parse_docstring=True)
