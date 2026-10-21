@@ -378,15 +378,18 @@ def ask_shared_inputs(names: list[str], scored: list[dict]) -> dict | None:
     }
 
 
-def build_answers(name: str, shared: dict, sections: list[dict], model) -> dict:
+def build_answers(name: str, shared: dict, sections: list[dict], model,
+                  pronoun: str | None = None) -> dict:
     """Per person, per section: {"score", "section_remark", "subcat_remarks"}.
 
     Kudos, when set, comes back under the KUDOS section with only "remark".
+    `pronoun` is the reviewer's choice; without one it is inferred.
     """
     result: dict = {}
     note = shared["note"]
-    pronoun = infer_pronoun(model, name)
-    err_console.print(f"[dim]· {name.split()[0]} → {pronoun}[/dim]")
+    if pronoun not in PRONOUNS:
+        pronoun = infer_pronoun(model, name)
+        err_console.print(f"[dim]· {name.split()[0]} → {pronoun}[/dim]")
     scores = shared["scores"]
     for section in sections:
         if section["name"] == KUDOS:

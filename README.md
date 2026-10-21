@@ -244,10 +244,14 @@ uv run python app/main.py web          # http://127.0.0.1:8000
   pause on a card you approve or reject, as the CLI's confirmation does.
 - **HRMS actions**: balances, history, holidays, colleagues, feedback requests,
   and forms to apply leave, apply WFH and cancel leave, without the model.
+- **Feedback**: the `feedback` filler. Pick a form from `feedback/` (or download
+  one), tick a batch of colleagues, give section scores, a brief note and
+  kudos, and the model drafts every remark. Edit any draft, then save a
+  `_filled_` copy (the blank form is never changed) and upload it to the HRMS.
 - **Admin**: `check`, `stats`, `ingest` (files in `data/` only), `reset`, `pa`.
 
 It binds to 127.0.0.1 by default; sessions live in RAM, so a restart logs
-everyone out. `discover` and the interactive `feedback` filler stay CLI-only.
+everyone out. `discover` stays CLI-only.
 Answers are rendered without links or images, so a reply cannot make the
 browser fetch a URL.
 

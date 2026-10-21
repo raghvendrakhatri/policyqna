@@ -272,6 +272,27 @@ def weekend_only(start_date: str, end_date: str) -> dict | None:
     return None
 
 
+def past_month(start_date: str, today: date | None = None) -> dict | None:
+    """An error dict when the leave or WFH starts before the current month:
+    backdating is only allowed within this month. None otherwise, including
+    for dates the HRMS should reject itself."""
+    try:
+        start = date.fromisoformat(start_date)
+    except ValueError:
+        return None
+    first = (today or date.today()).replace(day=1)
+    if start < first:
+        return {"error": f"{start.isoformat()} is in a past month. Leave and WFH can "
+                         f"only be backdated within the current month (from "
+                         f"{first.isoformat()}). Tell the employee; do not retry."}
+    return None
+
+
+def date_problem(start_date: str, end_date: str) -> dict | None:
+    """The first rule these dates break, as an error dict, or None."""
+    return weekend_only(start_date, end_date) or past_month(start_date)
+
+
 def match_leave_type(types: list[dict], wanted: str) -> dict | None:
     """The one type whose name is `wanted`, or the only one containing it:
     "casual" finds "Casual Leave". None when nothing or several match."""
@@ -315,7 +336,8 @@ def apply_leave(
 ) -> dict:
     """Submit a leave application for the employee once they have asked to
     apply. The employee is shown the details and confirms before it is sent.
-    Leave is for working days only, never a Saturday or Sunday.
+    Leave is for working days only, never a Saturday or Sunday, and can only be
+    backdated within the current month.
 
     Args:
         leave_type: Name of the leave type, such as "Casual Leave", as
@@ -326,9 +348,9 @@ def apply_leave(
         people_to_notify: Ids of colleagues to notify, from get_team_members.
             Omit to notify nobody.
     """
-    weekend = weekend_only(start_date, end_date)
-    if weekend:
-        return weekend
+    problem = date_problem(start_date, end_date)
+    if problem:
+        return problem
     data = fetch_dashboard(access_token)
     if data.get("error"):
         return data
@@ -429,16 +451,17 @@ def apply_wfh(
 ) -> dict:
     """Submit a work-from-home request for the employee once they have asked
     to apply. The employee is shown the details and confirms before it is sent.
-    WFH is for working days only, never a Saturday or Sunday.
+    WFH is for working days only, never a Saturday or Sunday, and can only be
+    backdated within the current month.
 
     Args:
         start_date: First WFH day, YYYY-MM-DD.
         end_date: Last WFH day, YYYY-MM-DD. Same as start_date for one day.
         is_half_day: True for a half-day WFH on a single date.
     """
-    weekend = weekend_only(start_date, end_date)
-    if weekend:
-        return weekend
+    problem = date_problem(start_date, end_date)
+    if problem:
+        return problem
     body = {
         "wfh_type_id": WFH_TYPE_ID,
         "start_date": start_date,

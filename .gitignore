@@ -222,3 +222,6 @@ profiles/
 
 # Feedback forms downloaded by save_feedback_form: colleagues names and emails.
 feedback/
+
+
+.DS_Store

@@ -56,6 +56,20 @@
   .actions { display: flex; gap: 8px; margin-top: 12px; flex-wrap: wrap; }
   .muted { color: var(--muted); font-size: 13px; }
 
+  /* feedback */
+  .people { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 4px 12px; margin-top: 8px; }
+  .people label { margin: 0; }
+  .tag { font-size: 11px; padding: 1px 6px; border-radius: 10px; background: var(--code); color: var(--muted); }
+  .tag.done { background: var(--accent-soft); color: var(--accent); }
+  .scores { display: grid; grid-template-columns: repeat(auto-fill, minmax(200px, 1fr)); gap: 10px; }
+  .scores .muted { font-size: 12px; }
+  details.draft { border: 1px solid var(--border); border-radius: 8px; padding: 10px 12px; margin-top: 10px; }
+  details.draft summary { cursor: pointer; font-weight: 600; display: flex; gap: 8px; align-items: center; }
+  details.draft h3 { font-size: 14px; margin: 14px 0 4px; display: flex; gap: 8px; align-items: center; }
+  details.draft h3 input { width: 64px; }
+  details.draft textarea { font-family: inherit; font-size: 14px; }
+  .step { font-size: 12px; font-weight: 700; color: var(--accent); text-transform: uppercase; letter-spacing: .04em; }
+
   /* chat */
   #log { display: flex; flex-direction: column; gap: 12px; min-height: 300px;
          max-height: calc(100vh - 290px); overflow-y: auto; padding: 4px; }
@@ -98,6 +112,7 @@
   <nav>
     <button data-tab="chat" class="active">Chat</button>
     <button data-tab="actions">HRMS actions</button>
+    <button data-tab="feedback">Feedback</button>
     <button data-tab="admin">Admin</button>
   </nav>
   <div class="who">
@@ -184,14 +199,68 @@
           <button class="btn ghost" id="teamBtn">Find colleagues</button></div>
         <div class="actions">
           <button class="btn ghost" data-tool="get_feedback_requests">Feedback requests</button>
-          <button class="btn ghost" id="fbFiles">Feedback files</button>
         </div>
-        <p class="muted">Download, fill and submit feedback forms by asking in Chat.</p>
+        <p class="muted">Fill and upload feedback forms in the Feedback tab.</p>
       </div>
     </div>
     <div class="card" style="margin-top:16px">
       <h2 id="resultTitle">Result</h2>
       <div class="out" id="actionOut"><span class="muted">Pick an action above.</span></div>
+    </div>
+  </section>
+
+  <!-- FEEDBACK -->
+  <section class="tab" id="tab-feedback">
+    <div class="card">
+      <div class="step">1 · Form</div>
+      <h2>Pick a feedback form</h2>
+      <div class="row">
+        <select id="fbFile"></select>
+        <button class="btn ghost" id="fbReload" title="Refresh the list">↻</button>
+        <button class="btn" id="fbLoad">Open</button>
+      </div>
+      <details style="margin-top:10px"><summary class="muted">Get a fresh form from the HRMS</summary>
+        <div class="row" style="margin-top:8px">
+          <input id="fbReqName" placeholder="Project or form name (empty if you have only one)">
+          <button class="btn ghost" id="fbDownload">Download</button>
+        </div>
+      </details>
+      <p class="muted" id="fbFolder"></p>
+    </div>
+
+    <div id="fbWork" style="display:none">
+      <div class="card">
+        <div class="step">2 · Colleagues</div>
+        <h2>Who are you giving feedback to in this batch?</h2>
+        <div class="row" style="flex:0"><input id="fbFilter" placeholder="Filter names…">
+          <button class="btn ghost" id="fbNone">Clear selection</button></div>
+        <div class="people" id="fbPeople"></div>
+      </div>
+
+      <div class="card">
+        <div class="step">3 · Scores &amp; note</div>
+        <h2>Applied to everyone selected <span class="muted" id="fbSelCount"></span></h2>
+        <div class="scores" id="fbScores"></div>
+        <label>Brief note <span class="muted">— the model rephrases this per section; it won't add facts you didn't write</span></label>
+        <textarea id="fbNote" rows="3" style="font-family:inherit"></textarea>
+        <label>Kudos <span class="muted">(optional, copied as written)</span></label>
+        <input id="fbKudos">
+        <label>Pronoun used in the remarks</label>
+        <div id="fbPronouns" class="people"></div>
+        <div class="actions"><button class="btn" id="fbDraft">Draft feedback</button>
+          <span class="muted" id="fbProgress"></span></div>
+      </div>
+
+      <div class="card">
+        <div class="step">4 · Review &amp; save</div>
+        <h2>Drafts <span class="muted" id="fbDraftCount"></span></h2>
+        <p class="muted" id="fbEmpty">Nothing drafted yet. Every remark can be edited before saving.</p>
+        <div id="fbDrafts"></div>
+        <div class="actions">
+          <button class="btn" id="fbSave" disabled>Save filled copy</button>
+        </div>
+        <div class="out" id="fbSaved"></div>
+      </div>
     </div>
   </section>
 
@@ -351,6 +420,7 @@ $$("nav button").forEach(b => b.onclick = () => {
   $$("nav button").forEach(x => x.classList.toggle("active", x === b));
   $$(".tab").forEach(t => t.classList.toggle("active", t.id === "tab-" + b.dataset.tab));
   if (b.dataset.tab === "admin" && !$("#ingestFile").options.length) loadDataFiles();
+  if (b.dataset.tab === "feedback" && !$("#fbFile").options.length) loadFeedbackFiles();
 });
 
 function firstLine(profile, key) {
@@ -476,17 +546,18 @@ $("#histBtn").onclick = () => {
     kind === "leave" ? { type, page_size: 20 } : { type }, `${type} ${kind}`);
 };
 $("#teamBtn").onclick = () => runTool("get_team_members", { name: $("#teamName").value }, "Colleagues");
-$("#fbFiles").onclick = async () => {
-  $("#resultTitle").textContent = "Feedback files";
-  try { $("#actionOut").innerHTML = render(await api("/api/feedback-files")); }
-  catch (e) { $("#actionOut").innerHTML = `<p class="err">${esc(e.message)}</p>`; }
-};
 
 async function loadBalance() {
   const r = await runTool("get_leave_balance", {}, "Leave balance");
   if (!r || r.error) return;
   $("#leaveType").innerHTML = (r.leave_types || []).map(t => `<option value="${esc(t.name)}">${esc(t.name)}${t.balance !== undefined ? ` (${esc(t.balance)} left)` : ""}</option>`).join("") || "<option value=''>No leave types</option>";
   $("#cancelPick").innerHTML = (r.upcoming_leaves || []).map(l => `<option value="${esc(l.start_date)}|${esc(l.leave_type)}">${esc(l.start_date)}${l.end_date && l.end_date !== l.start_date ? " → " + esc(l.end_date) : ""} · ${esc(l.leave_type)}${l.approved === false ? " · pending" : ""}</option>`).join("") || "<option value=''>No upcoming leave</option>";
+}
+// Leave and WFH can only be backdated within the current month.
+{
+  const now = new Date();
+  const first = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, "0")}-01`;
+  ["#leaveStart", "#leaveEnd", "#wfhStart", "#wfhEnd"].forEach(id => $(id).min = first);
 }
 $("#loadTypes").onclick = loadBalance;
 $("#loadUpcoming").onclick = loadBalance;
@@ -519,6 +590,140 @@ async function loadBalanceQuiet() {
     if (r && !r.error) $("#cancelPick").innerHTML = (r.upcoming_leaves || []).map(l => `<option value="${esc(l.start_date)}|${esc(l.leave_type)}">${esc(l.start_date)} · ${esc(l.leave_type)}</option>`).join("") || "<option value=''>No upcoming leave</option>";
   } catch {}
 }
+
+// ---- feedback ----
+// The form, the colleagues picked for the batch, and every draft so far. The
+// drafts live only in this page until "Save filled copy" writes them.
+const fb = { form: null, selected: new Set(), drafts: {}, pronouns: {} };
+
+async function loadFeedbackFiles(pick) {
+  try {
+    const r = await api("/api/feedback/files");
+    $("#fbFolder").textContent = r.folder ? `Files in ${r.folder}` : "";
+    $("#fbFile").innerHTML = r.files.map(f => `<option value="${esc(f.file)}">${esc(f.file)}${f.filled ? "  (filled)" : ""}</option>`).join("")
+      || "<option value=''>No feedback forms yet — download one</option>";
+    if (pick) $("#fbFile").value = pick;
+  } catch (e) { $("#fbFolder").innerHTML = `<span class="err">${esc(e.message)}</span>`; }
+}
+$("#fbReload").onclick = () => loadFeedbackFiles();
+$("#fbDownload").onclick = async () => {
+  $("#fbDownload").disabled = true;
+  try {
+    const r = await api("/api/feedback/download", { form: $("#fbReqName").value });
+    if (r.error) throw new Error(r.error + (r.requests ? " — " + r.requests.map(q => q.project || q.form).join(", ") : ""));
+    await loadFeedbackFiles(r.file);
+    $("#fbFolder").innerHTML = `<span class="ok">Downloaded ${esc(r.file)}.</span>`;
+  } catch (e) { $("#fbFolder").innerHTML = `<span class="err">${esc(e.message)}</span>`; }
+  $("#fbDownload").disabled = false;
+};
+
+$("#fbLoad").onclick = async () => {
+  const file = $("#fbFile").value; if (!file) return;
+  if (Object.keys(fb.drafts).length && !confirm("Open another form? Unsaved drafts will be lost.")) return;
+  try {
+    fb.form = await api("/api/feedback/form?file=" + encodeURIComponent(file));
+  } catch (e) { $("#fbFolder").innerHTML = `<span class="err">${esc(e.message)}</span>`; return; }
+  fb.selected.clear(); fb.drafts = {}; fb.pronouns = {};
+  $("#fbSaved").innerHTML = "";
+  $("#fbScores").innerHTML = fb.form.sections.filter(s => !s.kudos).map(s => `
+    <div><label style="margin-top:0">${esc(s.name)}</label>
+      <select data-section="${esc(s.name)}"><option value="">Skip</option>
+        ${[5, 4, 3, 2, 1].map(n => `<option>${n}</option>`).join("")}</select>
+      <div class="muted">${s.aspects.map(esc).join(" · ")}</div></div>`).join("");
+  $("#fbWork").style.display = "";
+  drawPeople(); drawDrafts();
+};
+
+function drawPeople() {
+  const filter = $("#fbFilter").value.trim().toLowerCase();
+  $("#fbPeople").innerHTML = fb.form.colleagues.filter(c => c.name.toLowerCase().includes(filter)).map(c => `
+    <label class="inline"><input type="checkbox" value="${esc(c.name)}" ${fb.selected.has(c.name) ? "checked" : ""}>
+      ${esc(c.name)} ${fb.drafts[c.name] ? '<span class="tag done">drafted</span>' : c.filled ? '<span class="tag">in file</span>' : ""}</label>`).join("");
+  $$("#fbPeople input").forEach(i => i.onchange = () => {
+    i.checked ? fb.selected.add(i.value) : fb.selected.delete(i.value); drawPronouns();
+  });
+  drawPronouns();
+}
+function drawPronouns() {
+  $("#fbSelCount").textContent = fb.selected.size ? `· ${fb.selected.size} selected` : "· pick colleagues above";
+  $("#fbPronouns").innerHTML = [...fb.selected].map(n => `
+    <label class="inline">${esc(n)}
+      <select data-name="${esc(n)}" style="width:auto">
+        ${[["", "auto"], ["they", "they"], ["she", "she"], ["he", "he"]].map(([v, t]) => `<option value="${v}" ${fb.pronouns[n] === v ? "selected" : ""}>${t}</option>`).join("")}
+      </select></label>`).join("") || '<span class="muted">—</span>';
+  $$("#fbPronouns select").forEach(s => s.onchange = () => fb.pronouns[s.dataset.name] = s.value);
+}
+$("#fbFilter").oninput = drawPeople;
+$("#fbNone").onclick = () => { fb.selected.clear(); drawPeople(); };
+
+$("#fbDraft").onclick = async () => {
+  const names = [...fb.selected];
+  if (!names.length) return alert("Pick at least one colleague.");
+  const scores = Object.fromEntries($$("#fbScores select").filter(s => s.value).map(s => [s.dataset.section, +s.value]));
+  const kudos = $("#fbKudos").value.trim();
+  if (!Object.keys(scores).length && !kudos) return alert("Give at least one section score (or a kudos line).");
+  $("#fbDraft").disabled = true;
+  const failed = [];
+  for (const [i, name] of names.entries()) {
+    $("#fbProgress").textContent = `Drafting ${i + 1}/${names.length}: ${name}… (a local model takes a while per section)`;
+    try {
+      fb.drafts[name] = await api("/api/feedback/draft", {
+        file: fb.form.file, name, scores, note: $("#fbNote").value, kudos, pronoun: fb.pronouns[name] || "" });
+    } catch (e) { failed.push(`${name}: ${e.message}`); }
+    drawDrafts();
+  }
+  $("#fbProgress").innerHTML = failed.length ? `<span class="err">${failed.map(esc).join("<br>")}</span>`
+    : `<span class="ok">Drafted ${names.length}. Review below, then pick the next batch or save.</span>`;
+  fb.selected.clear(); drawPeople();
+  $("#fbDraft").disabled = false;
+};
+
+function drawDrafts() {
+  const names = Object.keys(fb.drafts);
+  $("#fbEmpty").style.display = names.length ? "none" : "";
+  $("#fbDraftCount").textContent = names.length ? `· ${names.length} colleague(s)` : "";
+  $("#fbSave").disabled = !names.length;
+  $("#fbDrafts").innerHTML = names.map(name => {
+    const d = fb.drafts[name];
+    const sections = fb.form.sections.filter(s => !s.kudos && d[s.name]).map(s => {
+      const e = d[s.name];
+      return `<h3>${esc(s.name)} <input type="number" min="1" max="5" value="${esc(e.score)}" data-n="${esc(name)}" data-s="${esc(s.name)}" data-f="score"></h3>
+        <label>Section remark</label>
+        <textarea rows="2" data-n="${esc(name)}" data-s="${esc(s.name)}" data-f="section_remark">${esc(e.section_remark)}</textarea>
+        ${Object.entries(e.subcat_remarks || {}).map(([a, r]) => `<label>${esc(a)}</label>
+          <textarea rows="2" data-n="${esc(name)}" data-s="${esc(s.name)}" data-a="${esc(a)}">${esc(r)}</textarea>`).join("")}`;
+    }).join("");
+    const kudos = d.Kudos ? `<h3>Kudos</h3><textarea rows="2" data-n="${esc(name)}" data-s="Kudos" data-f="remark">${esc(d.Kudos.remark)}</textarea>` : "";
+    const summary = fb.form.sections.filter(s => !s.kudos && d[s.name]).map(s => `${s.name} ${d[s.name].score}`).join(" · ");
+    return `<details class="draft"><summary>${esc(name)} <span class="muted" style="font-weight:400">${esc(summary)}</span>
+      <button class="btn ghost" data-drop="${esc(name)}" style="margin-left:auto;padding:2px 10px">Remove</button></summary>${sections}${kudos}</details>`;
+  }).join("");
+  // Edits go straight back into the drafts, so saving sends what is on screen.
+  $$("#fbDrafts [data-n]").forEach(el => el.oninput = () => {
+    const entry = fb.drafts[el.dataset.n][el.dataset.s];
+    if (el.dataset.a) entry.subcat_remarks[el.dataset.a] = el.value;
+    else entry[el.dataset.f] = el.dataset.f === "score" ? Math.min(5, Math.max(1, +el.value || 1)) : el.value;
+  });
+  $$("#fbDrafts [data-drop]").forEach(b => b.onclick = e => {
+    e.preventDefault(); delete fb.drafts[b.dataset.drop]; drawDrafts(); drawPeople();
+  });
+}
+
+$("#fbSave").onclick = () => into($("#fbSaved"), async () => {
+  const r = await api("/api/feedback/save", { file: fb.form.file, answers: fb.drafts });
+  await loadFeedbackFiles(fb.form.file);
+  return `<p class="ok">Saved ${esc(r.file)} · ${r.colleagues.length} colleague(s). The original form is unchanged.</p>
+    <div class="row"><input id="fbUpForm" placeholder="Project or form name (empty if you have only one request)">
+      <button class="btn" id="fbUpload" data-file="${esc(r.file)}">Upload to HRMS</button></div>
+    <div class="out" id="fbUpOut"></div>`;
+}).then(() => {
+  const up = $("#fbUpload"); if (!up) return;
+  up.onclick = () => {
+    if (!state.logged_in) return alert("Log in to the HRMS first.");
+    if (!confirm(`Upload ${up.dataset.file} to the HRMS?`)) return;
+    into($("#fbUpOut"), async () => render(await api("/api/feedback/submit", { file: up.dataset.file, form: $("#fbUpForm").value })));
+  };
+});
 
 // ---- admin ----
 async function into(el, fn) {

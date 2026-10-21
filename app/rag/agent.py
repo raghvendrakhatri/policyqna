@@ -56,7 +56,7 @@ from .guardrails import (
 )
 from .knowledge import load_knowledge
 from .models import llm
-from .tools import SUBDOMAIN, TOOLS, find_policy, weekend_only
+from .tools import SUBDOMAIN, TOOLS, date_problem, find_policy
 from .ui import console, err_console, refusal_panel, waiting
 
 
@@ -229,9 +229,9 @@ class Agent:
         if name in WRITE_TOOLS and not self.token:
             return {"type": "reject", "message": NOT_LOGGED_IN}
         if name in ("apply_leave", "apply_wfh"):
-            weekend = weekend_only(str(args.get("start_date")), str(args.get("end_date")))
-            if weekend:
-                return {"type": "reject", "message": weekend["error"]}
+            problem = date_problem(str(args.get("start_date")), str(args.get("end_date")))
+            if problem:
+                return {"type": "reject", "message": problem["error"]}
         return None
 
     def decide(self, name: str, args: dict) -> dict:

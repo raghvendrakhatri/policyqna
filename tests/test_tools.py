@@ -218,3 +218,14 @@ def test_holidays_are_upcoming_real_and_in_order():
 def test_past_holidays_only_when_asked():
     names = [h["name"] for h in tools.holiday_list(HOLIDAYS, date(2026, 10, 19), include_past=True)]
     assert names == ["Independence Day", "Diwali", "Republic Day"]
+
+
+def test_backdating_only_within_the_current_month():
+    today = date(2026, 10, 21)
+    assert tools.past_month("2026-10-05", today) is None  # same month
+    assert tools.past_month("2026-10-01", today) is None  # first of the month
+    assert tools.past_month("2026-11-03", today) is None  # future
+    error = tools.past_month("2026-09-30", today)["error"]
+    assert "past month" in error and "2026-10-01" in error
+    assert tools.past_month("2025-10-21", today) is not None  # same month, last year
+    assert tools.past_month("not a date", today) is None  # the HRMS's call

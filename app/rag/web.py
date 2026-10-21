@@ -10,11 +10,13 @@ the server is how everyone forgets, and is logged out.
 """
 
 import contextlib
+import csv
 import io
 import os
 import threading
 import uuid
 from dataclasses import dataclass, field
+from functools import cache
 
 from fastapi import Body, FastAPI, HTTPException, Request
 from fastapi.responses import FileResponse, JSONResponse
@@ -36,10 +38,30 @@ from .chain import Memory, Provenance, answer, build_chain, build_summariser, cl
 from .cli import health, pa_score
 from .config import DATA_DIR, TOP_K
 from .db import counts_by_source, indexed, store
+from .feedback import (
+    FIXED_COLS,
+    KUDOS,
+    PRONOUNS,
+    SCORE_MAX,
+    SCORE_MIN,
+    apply_to_rows,
+    build_answers,
+    output_path,
+    parse_csv,
+)
 from .ingest import cmd_ingest
 from .knowledge import knowledge_files, load_knowledge
-from .profile import profile_from
-from .tools import SUBDOMAIN, TOOLS, get_user_details, list_feedback_files, password_login
+from .models import llm
+from . import tools
+from .tools import (
+    SUBDOMAIN,
+    TOOLS,
+    feedback_files,
+    get_user_details,
+    password_login,
+    save_feedback_form,
+    submit_feedback_form,
+)
 
 STATIC = os.path.join(os.path.dirname(__file__), "static")
 COOKIE = "policyqa_sid"
@@ -278,9 +300,119 @@ def call_tool(request: Request, name: str, args: dict = Body(default_factory=dic
     return {"write": name in WRITE_TOOLS, "result": result}
 
 
-@app.get("/api/feedback-files")
-def feedback_files() -> dict:
-    return list_feedback_files.invoke({})
+# --- feedback forms ------------------------------------------------------
+# The `feedback` command in steps: load a CSV, draft one colleague at a time
+# (so the page can show progress through a slow local model), let the
+# reviewer edit the drafts, then write a `_filled_` copy and upload it.
+
+def feedback_path(file: str) -> str:
+    """Only a CSV already in the feedback folder, matched by exact name."""
+    if file not in feedback_files():
+        raise HTTPException(400, f"{file!r} is not in {tools.FEEDBACK_DIR}/.")
+    return os.path.join(tools.FEEDBACK_DIR, file)
+
+
+def read_form(file: str) -> tuple[str, list[list[str]], list[str], list[dict]]:
+    path = feedback_path(file)
+    try:
+        return (path, *parse_csv(path))
+    except SystemExit as exc:  # parse_csv's way of saying it is not a form
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/api/feedback/files")
+def list_feedback() -> dict:
+    return {"folder": os.path.abspath(tools.FEEDBACK_DIR),
+            "files": [{"file": n, "filled": "_filled_" in n} for n in feedback_files()]}
+
+
+@app.post("/api/feedback/download")
+def download_feedback(request: Request, form: str = Body("", embed=True)) -> dict:
+    """A fresh blank form from the HRMS into the feedback folder."""
+    session = session_for(request)
+    result = save_feedback_form.invoke({"access_token": logged_in(session), "request": form})
+    if result.get("saved_to"):
+        result["file"] = os.path.basename(result["saved_to"])
+    return result
+
+
+@app.get("/api/feedback/form")
+def feedback_form(file: str) -> dict:
+    _, rows, headers, sections = read_form(file)
+    # Only the answer cells count: the rows above the first section hold each
+    # colleague's email and the like.
+    answer_rows = [r for s in sections
+                   for r in [s["section_remarks_row"]]
+                   + [x for a in s["subcats"] for x in (a["score_row"], a["remarks_row"])]
+                   if r is not None]
+    colleagues = []
+    for i, name in enumerate(headers):
+        col = FIXED_COLS + i
+        filled = any(len(rows[r]) > col and rows[r][col].strip() for r in answer_rows)
+        colleagues.append({"name": name, "filled": filled})
+    return {
+        "file": file,
+        "colleagues": colleagues,
+        "sections": [{"name": s["name"], "kudos": s["name"] == KUDOS,
+                      "aspects": [a["name"] for a in s["subcats"] if a["name"]]}
+                     for s in sections],
+        "score_range": [SCORE_MIN, SCORE_MAX],
+    }
+
+
+@cache
+def feedback_model():
+    return llm()
+
+
+@app.post("/api/feedback/draft")
+def draft_feedback(file: str = Body(), name: str = Body(), scores: dict = Body(),
+                   note: str = Body(""), kudos: str = Body(""),
+                   pronoun: str = Body("")) -> dict:
+    """One colleague's answers, phrased by the model from the reviewer's
+    scores and note. Nothing is written."""
+    _, _, headers, sections = read_form(file)
+    if name not in headers:
+        raise HTTPException(400, f"{name!r} is not on this form.")
+    clean_scores = {}
+    for section, value in scores.items():
+        if value in (None, ""):
+            continue
+        if not (isinstance(value, int) and SCORE_MIN <= value <= SCORE_MAX):
+            raise HTTPException(400, f"{section}: score must be {SCORE_MIN}-{SCORE_MAX}.")
+        clean_scores[section] = value
+    if not clean_scores and not kudos.strip():
+        raise HTTPException(400, "Give at least one score or a kudos line.")
+    shared = {"scores": clean_scores, "note": note, "kudos": kudos.strip()}
+    return build_answers(name, shared, sections, feedback_model(),
+                         pronoun if pronoun in PRONOUNS else None)
+
+
+@app.post("/api/feedback/save")
+def save_feedback(file: str = Body(), answers: dict[str, dict] = Body()) -> dict:
+    """Write the (possibly edited) answers into a new `_filled_` copy. The form
+    it came from is never changed."""
+    path, rows, headers, sections = read_form(file)
+    unknown = [n for n in answers if n not in headers]
+    if unknown:
+        raise HTTPException(400, f"Not on this form: {', '.join(unknown)}.")
+    if not answers:
+        raise HTTPException(400, "Nothing to save.")
+    for name, entry in answers.items():
+        apply_to_rows(rows, headers, name, entry, sections)
+    out = output_path(path)
+    with open(out, "w", encoding="utf-8", newline="") as fh:
+        csv.writer(fh).writerows(rows)
+    return {"file": os.path.basename(out), "colleagues": list(answers)}
+
+
+@app.post("/api/feedback/submit")
+def submit_feedback(request: Request, file: str = Body(), form: str = Body("")) -> dict:
+    """Upload a filled CSV to the HRMS. The page confirms before calling."""
+    session = session_for(request)
+    feedback_path(file)
+    return submit_feedback_form.invoke({"access_token": logged_in(session),
+                                        "file": file, "request": form})
 
 
 # --- admin ---------------------------------------------------------------
