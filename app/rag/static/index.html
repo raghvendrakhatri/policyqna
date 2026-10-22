@@ -424,7 +424,7 @@
   </head>
   <body>
     <header>
-      <h1>PolicyQA</h1>
+      <h1>PolicyQNA</h1>
       <nav>
         <button data-tab="chat" class="active">Chat</button>
         <button data-tab="actions">HRMS actions</button>
@@ -744,6 +744,10 @@
           autocomplete="current-password"
         />
         <label>Subdomain</label><input id="lgSub" placeholder="" />
+        <label class="inline" style="margin-top: 10px"
+          ><input type="checkbox" id="lgRemember" /> Remember me (saves your
+          login on this computer and logs in each time the server starts)</label
+        >
         <p class="err" id="lgErr"></p>
         <div class="actions">
           <button class="btn" id="lgSubmit" value="ok">Log in</button>
@@ -1004,6 +1008,7 @@
               email: $("#lgEmail").value,
               password: $("#lgPass").value,
               subdomain: $("#lgSub").value,
+              remember: $("#lgRemember").checked,
             }),
           );
           $("#lgPass").value = "";
@@ -1081,7 +1086,8 @@
       <h2>${ACTION_TITLES.login}</h2>
       <input placeholder="Email" class="em" type="email" autocomplete="username">
       <input placeholder="Password" class="pw" type="password" style="margin-top:6px" autocomplete="current-password">
-      <input placeholder="Subdomain (${esc(state.subdomain)})" class="sd" style="margin-top:6px"></div>`;
+      <input placeholder="Subdomain (${esc(state.subdomain)})" class="sd" style="margin-top:6px">
+      <label class="inline" style="margin-top:8px"><input type="checkbox" class="rm"> Remember me</label></div>`;
               const rows = Object.entries(a.args)
                 .map(
                   ([k, v]) =>
@@ -1100,6 +1106,7 @@
                 email: $(".em", c).value,
                 password: $(".pw", c).value,
                 subdomain: $(".sd", c).value,
+                remember: $(".rm", c).checked,
               });
             return d;
           });

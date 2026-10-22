@@ -6,7 +6,9 @@ write), a request here returns the paused calls instead, and the page resumes
 the run with the employee's decisions.
 
 One session per browser cookie, held in RAM like the CLI's chat: restarting
-the server is how everyone forgets, and is logged out.
+the server is how everyone forgets, and is logged out - unless the employee
+ticked "Remember me", when the server logs in again with the saved login as
+it starts and every new session begins logged in.
 """
 
 import contextlib
@@ -53,7 +55,7 @@ from .feedback import (
 from .ingest import cmd_ingest
 from .knowledge import knowledge_files, load_knowledge
 from .models import llm
-from . import tools
+from . import saved_login, tools
 from .tools import (
     SUBDOMAIN,
     TOOLS,
@@ -95,10 +97,13 @@ class Session:
 
 def new_session() -> Session:
     memory = Memory(summariser=build_summariser())
-    return Session(memory=memory, agent=Agent(None, "", memory))
+    token, profile = REMEMBERED or (None, "")
+    return Session(memory=memory, agent=Agent(token, profile, memory))
 
 
 SESSIONS: dict[str, Session] = {}
+# (token, profile) from the saved login, which new sessions start with.
+REMEMBERED: tuple[str, str] | None = None
 app = FastAPI(title="policyqa")
 
 
@@ -142,27 +147,64 @@ def session_info(request: Request) -> dict:
 
 # --- login ---------------------------------------------------------------
 
-def sign_in(session: Session, email: str, password: str, subdomain: str) -> None:
-    token = password_login(email, password, subdomain or SUBDOMAIN)
+def hrms_session(email: str, password: str, subdomain: str) -> tuple[str, str] | dict:
+    """(token, profile) for these credentials, or the HRMS error dict."""
+    token = password_login(email, password, subdomain)
     if isinstance(token, dict):
-        raise HTTPException(401, f"Login failed: {token['error']}. {token.get('detail', '')}")
+        return token
     details = get_user_details.invoke({"access_token": token})
-    session.agent.context.access_token = token
-    session.agent.context.profile = details.get("profile", "") \
-        if not details.get("error") else ""
+    return token, details.get("profile", "") if not details.get("error") else ""
+
+
+def sign_in(session: Session, email: str, password: str, subdomain: str,
+            remember: bool = False) -> None:
+    subdomain = subdomain or SUBDOMAIN
+    result = hrms_session(email, password, subdomain)
+    if isinstance(result, dict):
+        raise HTTPException(401, f"Login failed: {result['error']}. {result.get('detail', '')}")
+    session.agent.context.access_token, session.agent.context.profile = result
+    if remember:
+        remember_login(email, password, subdomain, result)
+
+
+def remember_login(email: str, password: str, subdomain: str,
+                   result: tuple[str, str]) -> None:
+    global REMEMBERED
+    saved_login.save(email, password, subdomain)
+    REMEMBERED = result
+
+
+def restore_login() -> None:
+    """Log in with the saved login, if there is one, for sessions to start
+    with. A login that no longer works is kept: the HRMS may just be down."""
+    global REMEMBERED
+    saved = saved_login.load()
+    if not saved:
+        return
+    result = hrms_session(*saved)
+    if isinstance(result, dict):
+        print(f"Saved login failed: {result['error']}. {result.get('detail', '')}".strip())
+        return
+    REMEMBERED = result
+    print(f"Logged in as {saved[0]} with the saved login.")
 
 
 @app.post("/api/login")
 def login(request: Request, email: str = Body(), password: str = Body(),
-          subdomain: str = Body("")) -> dict:
+          subdomain: str = Body(""), remember: bool = Body(False)) -> dict:
     session = session_for(request)
     with session.lock:
-        sign_in(session, email.strip(), password, subdomain.strip())
+        sign_in(session, email.strip(), password, subdomain.strip(), remember)
     return session_info(request)
 
 
 @app.post("/api/logout")
 def logout(request: Request) -> dict:
+    """Logging out also forgets the saved login, or the next start would log
+    straight back in."""
+    global REMEMBERED
+    saved_login.forget()
+    REMEMBERED = None
     sid = request.cookies.get(COOKIE)
     if sid in SESSIONS:
         SESSIONS[sid] = new_session()
@@ -228,8 +270,8 @@ def chat(request: Request, message: str = Body(embed=True)) -> dict:
 
 @app.post("/api/chat/decide")
 def decide(request: Request, decisions: list[dict] = Body(embed=True)) -> dict:
-    """`decisions`: one {"index", "approve", "email"?, "password"?, "subdomain"?}
-    per action the page was shown."""
+    """`decisions`: one {"index", "approve", "email"?, "password"?, "subdomain"?,
+    "remember"?} per action the page was shown."""
     session = session_for(request)
     with session.lock:
         paused = session.paused
@@ -238,6 +280,7 @@ def decide(request: Request, decisions: list[dict] = Body(embed=True)) -> dict:
         session.paused = None
         chosen = {d.get("index"): d for d in decisions}
         resume = []
+        to_remember = None
         for i, req in enumerate(paused["requests"]):
             if paused["auto"][i]:
                 resume.append(paused["auto"][i])
@@ -249,6 +292,8 @@ def decide(request: Request, decisions: list[dict] = Body(embed=True)) -> dict:
                     session.agent.context.credentials = (
                         choice["email"].strip(), choice["password"],
                         (choice.get("subdomain") or "").strip() or SUBDOMAIN)
+                    if choice.get("remember"):
+                        to_remember = session.agent.context.credentials
                     resume.append({"type": "approve"})
                 else:
                     resume.append({"type": "reject", "message": LOGIN_DECLINED})
@@ -256,8 +301,12 @@ def decide(request: Request, decisions: list[dict] = Body(embed=True)) -> dict:
                 resume.append({"type": "approve"})
             else:
                 resume.append({"type": "reject", "message": WRITE_DECLINED})
-        return drive(session, Command(resume={"decisions": resume}),
-                     paused["config"], paused["question"])
+        reply = drive(session, Command(resume={"decisions": resume}),
+                      paused["config"], paused["question"])
+        # Saved only once the login tool has worked, so a typo is not kept.
+        if to_remember and session.token:
+            remember_login(*to_remember, (session.token, session.profile))
+        return reply
 
 
 @app.post("/api/chat/clear")
@@ -483,6 +532,7 @@ def pa(client_weight: float = Body(), team_weight: float = Body(),
 def serve(host: str, port: int) -> int:
     import uvicorn
 
+    restore_login()
     print(f"policyqa web UI on http://{host}:{port}")
     uvicorn.run(app, host=host, port=port, log_level="warning")
     return 0

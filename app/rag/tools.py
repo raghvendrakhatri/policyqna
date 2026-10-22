@@ -140,7 +140,7 @@ def get_leave_history(
     type: str = "past",
     status: str = "",
     page: int = 1,
-    page_size: int = 5,
+    page_size: int = 20,
 ) -> dict:
     """Get the employee's own leave applications.
 
@@ -152,8 +152,14 @@ def get_leave_history(
     """
     query = urlencode({"name": "", "status": status, "type": type,
                        "page": page, "page_size": page_size})
-    return hrms_request(f"{ATTENDANCE_BASE_URL}/api/self/leave-applications/?{query}",
-                        access_token)
+    result = hrms_request(f"{ATTENDANCE_BASE_URL}/api/self/leave-applications/?{query}",
+                          access_token)
+    if result.get("error"):
+        return result
+    # Only the leave itself: each application also carries the employee's
+    # whole record, which crowded the model's instructions out of NUM_CTX.
+    return {"total": dashboard_part(result, "count"),
+            "leaves": leave_applications(result)}
 
 
 @tool(parse_docstring=True)
@@ -231,16 +237,41 @@ def leave_types(data) -> list[dict]:
     return types
 
 
-def upcoming_leaves(data) -> list[dict]:
-    """The employee's booked leave still ahead, from a leave-dashboard response."""
+def fetch_upcoming(access_token: str) -> dict:
+    """The raw list of the employee's leave applications still ahead. Not the
+    dashboard's upcoming_leaves: that holds only the next few days, so a leave
+    a week out could be neither listed nor cancelled."""
+    query = urlencode({"name": "", "status": "", "type": "upcoming",
+                       "page": 1, "page_size": 100})
+    return hrms_request(f"{ATTENDANCE_BASE_URL}/api/self/leave-applications/?{query}",
+                        access_token)
+
+
+def leave_applications(data) -> list[dict]:
+    """Each application in a leave-applications response, as the employee
+    would describe it: no ids and nothing from their personal record."""
     return [{
-        "id": leave.get("leave_log_id"),
-        "leave_type": leave.get("leave_type_name"),
+        "leave_type": (leave.get("leave_type") or {}).get("name"),
         "start_date": leave.get("start_date"),
         "end_date": leave.get("end_date"),
         "days": leave.get("duration_days"),
-        "approved": leave.get("is_approved"),
-    } for leave in dashboard_part(data, "leaves", "upcoming_leaves") or []]
+        "half_day": leave.get("is_half_day"),
+        "status": leave.get("status"),
+    } for leave in dashboard_part(data, "results") or []]
+
+
+def upcoming_leaves(data) -> list[dict]:
+    """The employee's booked leave still ahead, from a leave-applications
+    response: cancelled and rejected applications are not booked."""
+    return [{
+        "id": leave.get("leave_log_id"),
+        "leave_type": (leave.get("leave_type") or {}).get("name"),
+        "start_date": leave.get("start_date"),
+        "end_date": leave.get("end_date"),
+        "days": leave.get("duration_days"),
+        "approved": (leave.get("status") or "").lower() == "approved",
+    } for leave in dashboard_part(data, "results") or []
+        if (leave.get("status") or "").lower() not in ("cancelled", "rejected")]
 
 
 def next_holiday(data) -> dict | None:
@@ -305,7 +336,7 @@ def match_leave_type(types: list[dict], wanted: str) -> dict | None:
 
 
 def fetch_dashboard(access_token: str) -> dict:
-    """The raw leave dashboard: leave types, upcoming leave, next holiday."""
+    """The raw leave dashboard: leave types and the next holiday."""
     return hrms_request(f"{ATTENDANCE_BASE_URL}/api/leaves/dashboard", access_token)
 
 
@@ -317,10 +348,13 @@ def get_leave_balance(access_token: Annotated[str, InjectedToolArg]) -> dict:
     data = fetch_dashboard(access_token)
     if data.get("error"):
         return data
+    upcoming = fetch_upcoming(access_token)
+    if upcoming.get("error"):
+        return upcoming
     # The ids stay here: apply_leave and cancel_leave look them up themselves.
     return {
         "leave_types": [without_id(t) for t in leave_types(data)],
-        "upcoming_leaves": [without_id(l) for l in upcoming_leaves(data)],
+        "upcoming_leaves": [without_id(l) for l in upcoming_leaves(upcoming)],
         "next_holiday": next_holiday(data),
     }
 
@@ -389,7 +423,7 @@ def cancel_leave(
         leave_type: Name of its leave type. Only needed when two leaves start
             on the same day.
     """
-    data = fetch_dashboard(access_token)
+    data = fetch_upcoming(access_token)
     if data.get("error"):
         return data
     upcoming = upcoming_leaves(data)

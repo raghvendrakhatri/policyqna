@@ -44,14 +44,24 @@ DASHBOARD = {"error": None, "data": {
                 "configuration": {"applying_leave": None, "leave_approval": None},
             },
         ],
-        "upcoming_leaves": [{"leave_type_id": "t-el", "leave_type_name": "el-1",
-                             "leave_log_id": "log-1",
-                             "start_date": "2026-10-12", "end_date": "2026-10-12",
-                             "duration_days": 1.0, "is_approved": False}],
     },
     "upcoming_holidays": {"name": "Gandhi", "date": "2026-10-14",
                           "description": None, "is_optional": False},
 }}
+
+# /api/self/leave-applications/?type=upcoming, trimmed. A leave cancelled and
+# applied for again leaves both on the same date.
+UPCOMING = {"error": None, "data": {"count": 3, "next": None, "results": [
+    {"leave_log_id": "log-1", "leave_type": {"leave_type_id": "t-el", "name": "el-1"},
+     "start_date": "2026-10-12", "end_date": "2026-10-12", "duration_days": 1.0,
+     "status": "Pending"},
+    {"leave_log_id": "log-0", "leave_type": {"leave_type_id": "t-el", "name": "el-1"},
+     "start_date": "2026-10-12", "end_date": "2026-10-12", "duration_days": 1.0,
+     "status": "Cancelled"},
+    {"leave_log_id": "log-2", "leave_type": {"leave_type_id": "t-el", "name": "el-1"},
+     "start_date": "2026-10-27", "end_date": "2026-10-28", "duration_days": 2.0,
+     "status": "Approved"},
+]}}
 
 
 def test_balances_come_from_the_entry_not_the_nested_type():
@@ -74,9 +84,12 @@ def test_approvers_never_reach_the_model():
 
 
 def test_upcoming_leave_and_holiday():
-    assert tools.upcoming_leaves(DASHBOARD) == [{
-        "id": "log-1", "leave_type": "el-1", "start_date": "2026-10-12", "end_date": "2026-10-12",
-        "days": 1.0, "approved": False}]
+    assert tools.upcoming_leaves(UPCOMING) == [
+        {"id": "log-1", "leave_type": "el-1", "start_date": "2026-10-12",
+         "end_date": "2026-10-12", "days": 1.0, "approved": False},
+        {"id": "log-2", "leave_type": "el-1", "start_date": "2026-10-27",
+         "end_date": "2026-10-28", "days": 2.0, "approved": True},
+    ]  # the cancelled one is not booked
     assert tools.next_holiday(DASHBOARD) == {
         "name": "Gandhi", "date": "2026-10-14", "optional": False}
 
@@ -107,7 +120,7 @@ CANCELLED = {"error": None, "data": {
 
 def test_cancel_finds_the_leave_by_date(monkeypatch):
     sent = []
-    monkeypatch.setattr(tools, "fetch_dashboard", lambda token: DASHBOARD)
+    monkeypatch.setattr(tools, "fetch_upcoming", lambda token: UPCOMING)
 
     def request(url, token, body=None, method=None):
         sent.append((url, body, method))
@@ -123,7 +136,7 @@ def test_cancel_finds_the_leave_by_date(monkeypatch):
 
 def test_cancel_with_no_matching_leave_sends_nothing(monkeypatch):
     sent = []
-    monkeypatch.setattr(tools, "fetch_dashboard", lambda token: DASHBOARD)
+    monkeypatch.setattr(tools, "fetch_upcoming", lambda token: UPCOMING)
     monkeypatch.setattr(tools, "hrms_request", lambda *a, **k: sent.append(a) or {})
     result = tools.cancel_leave.func("tok", "2026-11-01")
     assert "No upcoming leave" in result["error"] and sent == []
@@ -229,3 +242,15 @@ def test_backdating_only_within_the_current_month():
     assert "past month" in error and "2026-10-01" in error
     assert tools.past_month("2025-10-21", today) is not None  # same month, last year
     assert tools.past_month("not a date", today) is None  # the HRMS's call
+
+
+def test_leave_history_carries_no_personal_record(monkeypatch):
+    raw = {"error": None, "data": {"count": 1, "results": [
+        dict(UPCOMING["data"]["results"][0], is_half_day=False,
+             employee_details={"full_name": "Me", "date_of_birth": "2008-02-06"}),
+    ]}}
+    monkeypatch.setattr(tools, "hrms_request", lambda *a, **k: raw)
+    result = tools.get_leave_history.func("tok", type="upcoming")
+    assert result == {"total": 1, "leaves": [{
+        "leave_type": "el-1", "start_date": "2026-10-12", "end_date": "2026-10-12",
+        "days": 1.0, "half_day": False, "status": "Pending"}]}

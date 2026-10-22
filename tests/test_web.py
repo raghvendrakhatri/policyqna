@@ -196,3 +196,65 @@ def test_backdated_write_from_a_past_month_is_settled_without_asking(client):
     r = client.post("/api/chat", json={"message": "leave on 3 jan 2000"}).json()
     assert r["kind"] == "answer"
     assert "past month" in seen[1].resume["decisions"][0]["message"]
+
+
+@pytest.fixture
+def saved(monkeypatch, tmp_path):
+    """The saved login in a temp file, and an HRMS that takes any password."""
+    path = tmp_path / "login.json"
+    monkeypatch.setattr(web.saved_login, "PATH", str(path))
+    monkeypatch.setattr(web, "REMEMBERED", None)
+    monkeypatch.setattr(web, "hrms_session",
+                        lambda email, password, sub: (f"token-{email}", "full_name: Me"))
+    return path
+
+
+def test_remember_me_saves_the_login_for_new_sessions(client, saved):
+    r = client.post("/api/login", json={"email": "me@x.com", "password": "pw",
+                                        "subdomain": "", "remember": True}).json()
+    assert r["logged_in"]
+    assert web.saved_login.load() == ("me@x.com", "pw", web.SUBDOMAIN)
+    assert oct(os.stat(saved).st_mode & 0o777) == "0o600"
+    assert web.new_session().token == "token-me@x.com"
+
+
+def test_without_remember_me_nothing_is_saved(client, saved):
+    client.post("/api/login", json={"email": "me@x.com", "password": "pw"})
+    assert not saved.exists() and web.new_session().token is None
+
+
+def test_server_start_logs_in_with_the_saved_login(saved):
+    web.saved_login.save("me@x.com", "pw", "dev1")
+    web.restore_login()
+    assert web.REMEMBERED == ("token-me@x.com", "full_name: Me")
+
+
+def test_a_failing_saved_login_starts_logged_out(saved, monkeypatch):
+    web.saved_login.save("me@x.com", "old", "dev1")
+    monkeypatch.setattr(web, "hrms_session", lambda *a: {"error": "HRMS returned 401"})
+    web.restore_login()
+    assert web.REMEMBERED is None and saved.exists()
+
+
+def test_logout_forgets_the_saved_login(client, saved):
+    client.post("/api/login", json={"email": "me@x.com", "password": "pw", "remember": True})
+    assert not client.post("/api/logout").json()["logged_in"]
+    assert not saved.exists() and web.REMEMBERED is None
+
+
+def test_chat_login_is_remembered_once_it_worked(client, saved):
+    session = next(iter(web.SESSIONS.values()))
+    states = iter([paused(("login", {})), done("Logged in.", ("login",))])
+
+    def step(payload, config):
+        state = next(states)
+        if "__interrupt__" not in state:  # the login tool ran
+            session.agent.context.access_token = "tok"
+        return state
+
+    session.agent.step = step
+    client.post("/api/chat", json={"message": "log me in"})
+    client.post("/api/chat/decide", json={"decisions": [
+        {"index": 0, "approve": True, "email": "me@x.com", "password": "pw",
+         "remember": True}]})
+    assert web.saved_login.load() == ("me@x.com", "pw", web.SUBDOMAIN)

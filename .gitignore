@@ -225,3 +225,5 @@ feedback/
 
 
 .DS_Store
+# The HRMS login saved by "Remember me" in the web UI: a plain password.
+.hrms_login.json
