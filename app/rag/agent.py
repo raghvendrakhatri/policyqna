@@ -192,7 +192,8 @@ class Agent:
                 requests = pending(state)
                 if not requests:
                     break
-                decisions = [self.decide(r["name"], r["args"]) for r in requests]
+                decisions = [self.decide(r["name"], r["args"], state["messages"])
+                             for r in requests]
                 payload = Command(resume={"decisions": decisions})
         except GraphRecursionError:
             return STEPS_EXHAUSTED
@@ -234,7 +235,7 @@ class Agent:
                 return {"type": "reject", "message": problem["error"]}
         return None
 
-    def decide(self, name: str, args: dict) -> dict:
+    def decide(self, name: str, args: dict, messages: list) -> dict:
         """The employee's answer to one paused call, asked at the terminal."""
         automatic = self.auto_decision(name, args)
         if automatic:
@@ -244,7 +245,7 @@ class Agent:
             if self.context.credentials:
                 return {"type": "approve"}
             return {"type": "reject", "message": LOGIN_DECLINED}
-        if confirm(name, args):
+        if confirm(name, shown_args(args, messages)):
             return {"type": "approve"}
         return {"type": "reject", "message": WRITE_DECLINED}
 
@@ -357,13 +358,40 @@ def ask_credentials() -> tuple[str, str, str] | None:
     return email, password, subdomain or SUBDOMAIN
 
 
+def member_names(messages: list) -> dict[str, str]:
+    """Colleague id -> "Name (email)" from the get_team_members results in
+    `messages`: the model looks people up there before notifying them."""
+    names: dict[str, str] = {}
+    for m in messages:
+        if not (isinstance(m, ToolMessage) and m.name == "get_team_members"):
+            continue
+        try:
+            members = json.loads(m.content).get("data")
+        except (TypeError, ValueError, AttributeError):
+            continue
+        for member in members if isinstance(members, list) else []:
+            if member.get("id") and member.get("full_name"):
+                email = member.get("official_email")
+                names[member["id"]] = (f"{member['full_name']} ({email})" if email
+                                       else member["full_name"])
+    return names
+
+
+def shown_args(args: dict, messages: list) -> dict:
+    """A paused call's arguments as the employee sees them: no token, and
+    colleagues to notify by name rather than id. What is sent is unchanged."""
+    shown = {k: v for k, v in args.items() if k != "access_token"}
+    if shown.get("people_to_notify"):
+        names = member_names(messages)
+        shown["people_to_notify"] = [names.get(i, i) for i in shown["people_to_notify"]]
+    return shown
+
+
 def confirm(name: str, args: dict) -> bool:
     """Show exactly what will be sent and ask. Anything but y/yes is a no."""
     body = Text()
     body.append(f"  action  {name}\n", style="bold")
     for key, value in args.items():
-        if key == "access_token":
-            continue
         body.append(f"  {key:<16} ", style="dim")
         body.append(f"{json.dumps(value) if isinstance(value, list) else value}\n")
     console.print()

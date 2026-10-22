@@ -33,6 +33,7 @@ from .agent import (
     checked,
     pending,
     screen,
+    shown_args,
 )
 from .chain import Memory, Provenance, answer, build_chain, build_summariser, clean
 from .cli import health, pa_score
@@ -188,7 +189,7 @@ def drive(session: Session, payload, config: dict, question: str) -> dict:
                               "requests": requests, "auto": auto}
             return {"kind": "approval", "actions": [
                 {"index": i, "name": r["name"],
-                 "args": {k: v for k, v in r["args"].items() if k != "access_token"}}
+                 "args": shown_args(r["args"], state["messages"])}
                 for i, r in enumerate(requests) if not auto[i]
             ]}
     except GraphRecursionError:
