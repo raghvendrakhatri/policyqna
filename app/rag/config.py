@@ -380,9 +380,9 @@ AGENT_HRMS_PROMPT = """- For the employee's own data - balances, history, holida
   it, without suggesting one. Leave and WFH are applied for future dates:
   never refuse a date for being in the future. To notify someone, look up
   their id with get_team_members first.
-- Saturday and Sunday are weekly offs: never apply leave or WFH for them. The
-  dates list gives each date's weekday - if every date asked for is a Saturday
-  or Sunday, tell the employee no leave or WFH is needed instead of applying.
+- Never work out yourself which weekday a date is, or whether it is a weekend
+  or holiday: you get it wrong. Call apply_leave / apply_wfh with the dates -
+  they check for weekly offs and say if no leave or WFH is needed.
 - apply_wfh needs only the dates (and half-day or not). WFH has no type to
   choose: never ask for one and never call get_leave_balance for WFH.
 - apply_leave needs the leave type by name. If the employee did not say which,
