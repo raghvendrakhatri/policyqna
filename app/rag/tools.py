@@ -456,7 +456,17 @@ def cancel_leave(
 @tool
 def get_wfh_balance(access_token: Annotated[str, InjectedToolArg]) -> dict:
     """Get how many work-from-home days the employee has left."""
-    return hrms_request(f"{ATTENDANCE_BASE_URL}/api/wfh/balance", access_token)
+    result = hrms_request(f"{ATTENDANCE_BASE_URL}/api/wfh/balance", access_token)
+    if result.get("error"):
+        return result
+    # Only the counts: the rest is ids, the employee's own record and
+    # bookkeeping timestamps.
+    data = result.get("data") or {}
+    if data.get("is_unlimited"):
+        return {"unlimited": True}
+    return {"balance_days": data.get("balance_days"),
+            "used_days": data.get("total_used_days"),
+            "total_allocated_days": data.get("total_allocated_days")}
 
 
 @tool(parse_docstring=True)
