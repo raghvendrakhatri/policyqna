@@ -11,4 +11,4 @@ COPY knowledge ./knowledge
 
 RUN uv sync --frozen
 
-CMD ["uv", "run", "python", "-m", "app.rag", "stats"]
+CMD ["uv", "run", "python", "app/main.py", "stats"]

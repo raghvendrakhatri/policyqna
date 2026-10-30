@@ -11,6 +11,7 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
+from .agent import STEPS_EXHAUSTED, Agent, ask_agent
 from .chain import (
     Memory,
     Provenance,
@@ -43,6 +44,7 @@ from .profile import (
 )
 from .feedback import cmd_feedback
 from .ingest import cmd_ingest
+from .tools import get_user_details
 from .ui import chat_banner, console, err_console, waiting
 
 
@@ -51,19 +53,28 @@ def cmd_ask(question: str, k: int, token: str | None, profile_name: str | None,
     if not indexed():
         sys.exit("Nothing indexed yet - run `ingest` first.")
     provenance = Provenance() if sources else None
-    chain = build_chain(k, profile_text(token, profile_name), provenance)
-    ask(chain, question, provenance)
+    profile = session_profile(resolve_token(token), profile_name)
+    chain = build_chain(k, profile, provenance)
+    ask(chain, question, provenance, profile)
     return 0
 
 
-def cmd_chat(k: int, token: str | None, profile_name: str | None, sources: bool) -> int:
+def cmd_chat(k: int, token: str | None, profile_name: str | None, sources: bool,
+             tools: bool = True) -> int:
     if not indexed():
         sys.exit("Nothing indexed yet - run `ingest` first.")
+    # Resolved once, so --login opens one browser and the agent's tools get the
+    # same session the profile was read with.
+    token = resolve_token(token)
     # Fetched once per session, not per question: a chat would otherwise hammer
-    # the HRMS, and the balances should not shift underneath a conversation.
-    profile = profile_text(token, profile_name)
-    provenance = Provenance() if sources else None
+    # the HRMS, and the details should not shift underneath a conversation.
+    profile = session_profile(token, profile_name)
     memory = Memory(summariser=build_summariser())
+    # The agent by default: it can log in mid-chat, so it needs no token up front.
+    if tools:
+        return agent_loop(Agent(token, profile, memory), memory, profile, token,
+                          profile_name, k)
+    provenance = Provenance() if sources else None
     chain = build_chain(k, profile, provenance, memory=memory)  # built once
     contextualize = build_contextualizer()
 
@@ -96,9 +107,50 @@ def cmd_chat(k: int, token: str | None, profile_name: str | None, sources: bool)
             if standalone != question:
                 err_console.print(f"[dim italic]· reading that as: {standalone}[/dim italic]")
 
-        answer = ask(chain, standalone, provenance)
+        answer = ask(chain, standalone, provenance, profile)
         if answer:
             memory.remember(standalone, answer)
+
+
+def session_profile(token: str | None, profile_name: str | None) -> str:
+    """After login, only the employee's own record is loaded. Balances, leave
+    and attendance are read by the agent's tools when a question needs them."""
+    if token:
+        return user_details_profile(token)
+    return profile_text(None, profile_name)
+
+
+def user_details_profile(token: str) -> str:
+    """The employee's own record from the same HRMS the tools talk to."""
+    with waiting("reading your HRMS record"):
+        details = get_user_details.invoke({"access_token": token})
+    if details.get("error"):
+        sys.exit(f"Could not read your HRMS record: {details['error']}"
+                 f"\n{details.get('detail', '')}\nLog in again with --login.")
+    return profile_from(details)
+
+
+def agent_loop(agent: Agent, memory: Memory, profile: str, token: str | None,
+               profile_name: str | None, k: int) -> int:
+    """`chat --tools`. No follow-up rewrite: the agent reads the history itself."""
+    console.print()
+    console.print(chat_banner(profile, token, profile_name, False, k,
+                              tools=sorted(agent.tools)))
+    while True:
+        try:
+            console.print()
+            question = console.input("[bold cyan]❯[/bold cyan] ").strip()
+        except (EOFError, KeyboardInterrupt):
+            console.print()
+            return 0
+        if not question:
+            return 0
+        answer = ask_agent(agent, question, profile)
+        # A run that ran out of steps answered nothing. Remembered, it is the
+        # only answer in the history, and a 4B model repeats it word for word
+        # on the next questions without calling a tool.
+        if answer and answer != STEPS_EXHAUSTED:
+            memory.remember(question, answer)
 
 
 def cmd_stats() -> int:
@@ -130,6 +182,51 @@ def cmd_stats() -> int:
         console.print()
         console.print(ktable)
     return 0
+
+
+def health() -> list[tuple[str, str]]:
+    """Can we reach Postgres and Ollama, and are the models pulled? Each line is
+    ("ok" | "warn" | "fail", message); a "fail" ends the check there."""
+    try:
+        with psycopg.connect(
+            dbname=os.getenv("POSTGRES_DB"),
+            user=os.getenv("POSTGRES_USER"),
+            password=os.getenv("POSTGRES_PASSWORD"),
+            host=os.getenv("POSTGRES_HOST", "localhost"),
+            port=os.getenv("POSTGRES_PORT"),
+            connect_timeout=5,
+        ) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SELECT version()")
+                version = cur.fetchone()[0]
+    except psycopg.Error as exc:
+        return [("fail", f"Database ping failed: {exc}")]
+    lines = [("ok", f"Database OK: {version}")]
+
+    import urllib.error
+    import urllib.request
+
+    base_url = os.getenv("OLLAMA_BASE_URL")
+    try:
+        with urllib.request.urlopen(f"{base_url}/api/tags", timeout=5) as response:
+            models = [m["name"] for m in json.load(response).get("models", [])]
+    except (urllib.error.URLError, OSError) as exc:
+        return lines + [("fail", f"Ollama ping failed at {base_url}: {exc}")]
+    lines.append(("ok", f"Ollama OK at {base_url}: {len(models)} model(s) available"))
+
+    for var in ("CHAT_MODEL", "EMBED_MODEL"):
+        name = os.getenv(var)
+        if name and name not in models:
+            lines.append(("warn", f"Warning: {var}={name} is not pulled. `ollama pull {name}`"))
+    return lines
+
+
+def cmd_check() -> int:
+    """Health check: can we reach Postgres and Ollama, and are the models pulled?"""
+    lines = health()
+    for level, message in lines:
+        print(message, file=sys.stdout if level == "ok" else sys.stderr)
+    return 1 if lines[-1][0] == "fail" else 0
 
 
 def cmd_reset() -> int:
@@ -301,9 +398,11 @@ def add_profile_args(parser: argparse.ArgumentParser) -> None:
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        prog="rag", description="Ask questions about local policy documents, answered by Ollama."
+        prog="main.py", description="Ask questions about local policy documents, answered by Ollama."
     )
     sub = parser.add_subparsers(dest="command", required=True)
+
+    sub.add_parser("check", help="health check: Postgres and Ollama up, models pulled")
 
     p = sub.add_parser("ingest", help="chunk, embed and store a document")
     p.add_argument("path", nargs="?", default="data/policy.pdf")
@@ -316,6 +415,11 @@ def parse_args() -> argparse.Namespace:
 
     p = sub.add_parser("chat", help="interactive question loop")
     p.add_argument("-k", type=int, default=TOP_K)
+    p.add_argument(
+        "--no-tools",
+        action="store_true",
+        help="plain policy Q&A: no HRMS tools, no applying, no logging in mid-chat",
+    )
     add_profile_args(p)
 
     sub.add_parser("discover", help="find the HRMS endpoint holding your record")
@@ -329,6 +433,11 @@ def parse_args() -> argparse.Namespace:
     p = sub.add_parser("profile", help="show what the HRMS returns about you")
     add_profile_args(p)
 
+    p = sub.add_parser("web", help="serve the web UI")
+    p.add_argument("--host", default="127.0.0.1",
+                   help="interface to bind (default 127.0.0.1: this machine only)")
+    p.add_argument("--port", type=int, default=8000)
+
     sub.add_parser("stats", help="show what is indexed")
     sub.add_parser("reset", help="drop the collection")
     return parser.parse_args()
@@ -341,6 +450,9 @@ def main() -> int:
     if missing:
         sys.exit(f"Missing env vars: {', '.join(missing)}. Copy .env.example to .env.")
 
+    if args.command == "check":
+        return cmd_check()
+
     try:
         if args.command == "ingest":
             return cmd_ingest(args.path, args.replace)
@@ -348,7 +460,8 @@ def main() -> int:
             return cmd_ask(" ".join(args.question), args.k, chosen_token(args),
                            args.profile, not args.no_sources)
         if args.command == "chat":
-            return cmd_chat(args.k, chosen_token(args), args.profile, not args.no_sources)
+            return cmd_chat(args.k, chosen_token(args), args.profile, not args.no_sources,
+                            not args.no_tools)
         if args.command == "discover":
             return cmd_discover()
         if args.command == "pa":
@@ -359,6 +472,10 @@ def main() -> int:
             return cmd_profile(chosen_token(args), args.profile)
         if args.command == "stats":
             return cmd_stats()
+        if args.command == "web":
+            from .web import serve
+
+            return serve(args.host, args.port)
         return cmd_reset()
     except psycopg.OperationalError as exc:
         sys.exit(f"Cannot reach Postgres: {exc}\nIs it up? `docker compose up -d postgres`")

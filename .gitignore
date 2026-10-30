@@ -219,3 +219,11 @@ __marimo__/
 
 # Employee profiles fetched from the HRMS. Never commit real employee data.
 profiles/
+
+# Feedback forms downloaded by save_feedback_form: colleagues names and emails.
+feedback/
+
+
+.DS_Store
+# The HRMS login saved by "Remember me" in the web UI: a plain password.
+.hrms_login.json

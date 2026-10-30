@@ -47,9 +47,11 @@ COLLECTION = "policies"
 _PKG_DIR = os.path.dirname(os.path.dirname(__file__))  # .../app
 _REPO_DIR = os.path.dirname(_PKG_DIR)                  # repo root
 KNOWLEDGE_DIR = os.path.join(_REPO_DIR, "knowledge")
+# Documents to ingest. The web UI only ingests files from here.
+DATA_DIR = os.path.join(_REPO_DIR, "data")
 KNOWLEDGE_SUFFIXES = (".md", ".txt")
 KNOWLEDGE_SKIP = {"readme.md", "readme.txt"}  # notes about the folder, not facts
-KNOWLEDGE_WARN_CHARS = 6000
+KNOWLEDGE_WARN_CHARS = 7000
 
 # Who is asking. The profile comes from the HRMS, keyed by the employee's own
 # access token - nothing about an employee is stored in this repo. PROFILE_DIR is
@@ -134,8 +136,32 @@ MMR_FETCH_K = 30
 # the very section being asked about; 0.8 keeps relevance in charge.
 MMR_LAMBDA = 0.8
 
+# Below this normalised cosine score (0..1) no indexed chunk is close enough to
+# the question for an answer to be grounded. Tuned on in-domain questions
+# scoring ~0.45+ and off-topic ones ("capital of France") scoring <0.25.
+RELEVANCE_THRESHOLD = float(os.getenv("RELEVANCE_THRESHOLD", "0.30"))
+# A question with "my", "I", "me" may be answered from the HRMS profile alone,
+# so a low retrieval score is not grounds to refuse it.
+PERSONAL_RE = re.compile(
+    r"\b(my|mine|me|i|i'm|im|i've|ive|i'd|id|myself)\b",
+    re.I,
+)
 
-SYSTEM_PROMPT = """You answer questions about the policy documents given as context.
+# "apply wfh for 5 oct", "book leave tomorrow": a request to act, not a policy
+# question. The agent never refuses these as off-topic, and skips the policy
+# prefetch for one that names a date: excerpts about WFH quotas per band and
+# menstrual WFH made a 4B model ask which WFH "type" to use.
+ACTION_RE = re.compile(
+    r"\b(apply|book|request|submit|take|want|cancel)\b.*\b(leaves?|wfh|work from home)\b"
+    # "download the csv for this feedback form", "list colleagues to give
+    # feedback": the HRMS feedback tools. The classifier called the first out of
+    # scope, and policy excerpts made the model offer the form instead of fetching it.
+    r"|\bfeedback\b|\b(csv|colleagues?)\b",
+    re.I,
+)
+
+
+SYSTEM_PROMPT ="""You answer questions about the policy documents given as context.
 
 - Use only the context and the reference facts. If the answer is in neither, say
   so plainly.
@@ -239,6 +265,195 @@ Example
   New Q: what is my daily food allowance?
   New A: 1,900 - Gold band, Tier 1.
   out: user is Gold band, Tier 1, WFH balance 13.0 days as of 2026-09-23; daily food allowance 1,900."""
+
+
+TOPICALITY_PROMPT = """You are a classifier for a company HR/policy assistant.
+
+Decide if the question is in scope. Reply with exactly one word: yes or no.
+
+In scope: company policies, employee benefits, leave, work-from-home,
+reimbursement, performance appraisal, HR processes, workplace rules, and
+anything about the asker's own HRMS record (balances, band, manager, joining
+date, city tier, etc.).
+
+Out of scope: general knowledge (geography, history, trivia, sports), coding
+or technical help, creative writing, math/calculations unrelated to policy,
+current events, other companies, personal opinions, chit-chat.
+
+If the question is ambiguous but could plausibly be about company policy or
+the asker's record, answer yes.
+
+Always in scope (answer yes):
+- requests to apply for leave or WFH, or to see leave / WFH history, balances
+  or the holiday list
+- team-feedback requests and forms: listing them, the colleagues to give
+  feedback to, downloading or filling the feedback form
+- "who am I", "what is my name", "what is my role / band / designation"
+- "who is my manager", "when did I join", "what is my email"
+- "how many leaves / WFH days do I have left"
+- any question using "my", "I", "me" about work, role, HR, pay, or benefits."""
+
+
+# Agent mode's version of TOPICALITY_PROMPT: one call that both rejects
+# off-topic questions and decides whether the policy is searched before the
+# model sees the question. Searching on every question put WFH and leave
+# excerpts in front of "who am I" and "list my feedback requests".
+ROUTE_PROMPT = """You are a classifier for a company HR assistant. Reply with exactly one
+word: hrms, policy or no.
+
+hrms - ONLY when the question is one of these, which are answered from the
+  asker's live HRMS record or done in the HRMS:
+  - their remaining balance, or their leave or WFH history ("how many leaves
+    do I have left", "my upcoming leaves")
+  - the holiday list
+  - their own details: name, role, band, manager, email, joining date
+  - logging in
+  - applying for or cancelling leave or WFH ("apply wfh for 5 oct")
+  - team-feedback requests and forms: listing, downloading, uploading
+
+policy - any other question about the company: what the policy, handbook or
+  rules say, even when it mentions "I" or "my". Entitlements, eligibility,
+  carry forward, encashment, notice periods, allowances, reimbursement,
+  appraisal, conduct, how a process works.
+
+no - not about the company at all: general knowledge, coding, trivia,
+  chit-chat.
+
+Example
+  in:  how many casual leaves do I have left?
+  out: hrms
+
+Example
+  in:  how many leaves can I take in a year?
+  out: policy
+
+Example
+  in:  can I carry forward my earned leave?
+  out: policy
+
+Example
+  in:  what is my daily food allowance in Pune?
+  out: policy
+
+Example
+  in:  apply wfh for tomorrow
+  out: hrms
+
+Example
+  in:  what is the capital of France?
+  out: no"""
+
+
+# Agent mode (`chat --tools`). Bounded so a model that keeps calling tools
+# cannot loop forever; tool results are capped because NUM_CTX holds them all.
+AGENT_MAX_STEPS = 5
+TOOL_RESULT_MAX_CHARS = 8000
+# A question ROUTE_PROMPT calls a policy question is searched before the model
+# sees it, so a policy answer never depends on a 4B model choosing to call
+# search_policy. Fewer chunks than TOP_K: they ride along with the question.
+AGENT_PREFETCH_K = 5
+
+AGENT_PROMPT = """You are an HR assistant for the company. You answer questions about
+company policy and act on the employee's behalf in the HRMS, using the tools.
+
+Today is {today}.
+
+- For anything about what the policy says, ALWAYS call search_policy first and
+  answer only from what it returns - never from memory, and never say the
+  policy is silent without having searched. Quote the policy's wording for
+  limits and deadlines.
+{hrms}- If a tool returns an error, say what went wrong in plain words.
+- Answer directly and briefly: no preamble, no reasoning, no ids unless asked.
+- Only help with company policy, HR and the employee's HRMS record. Politely
+  refuse anything else."""
+
+
+# Fills {hrms} in AGENT_PROMPT, followed by AGENT_NO_LOGIN_PROMPT until the
+# employee logs in. The prompt is rebuilt on every model call, so the note
+# disappears the moment the login tool succeeds.
+AGENT_HRMS_PROMPT = """- For the employee's own data - balances, history, holidays, their record -
+  call the matching tool. Never guess a figure.
+- To apply for leave or WFH you need the dates. "15 october", "tomorrow" or
+  "next Monday" IS a date: the message lists it as YYYY-MM-DD under "Dates in
+  this message" - use that. A single date means a one-day leave, so start and
+  end are the same. Only when the employee gave no date at all, ask them for
+  it, without suggesting one. Leave and WFH are applied for future dates:
+  never refuse a date for being in the future. To notify someone, look up
+  their id with get_team_members first.
+- Never work out yourself which weekday a date is, or whether it is a weekend
+  or holiday: you get it wrong. Call apply_leave / apply_wfh with the dates -
+  they check for weekly offs and say if no leave or WFH is needed.
+- apply_wfh needs only the dates (and half-day or not). WFH has no type to
+  choose: never ask for one and never call get_leave_balance for WFH.
+- apply_leave needs the leave type by name. If the employee did not say which,
+  call get_leave_balance and ask them to pick one of the types it lists.
+  Leave type names come from the HRMS, not the policy: a name such as "el-1"
+  need not appear in the policy. Never reject a type name yourself - pass it to
+  apply_leave, which checks it and says if it does not exist.
+- To cancel a leave, call cancel_leave with its start date. If the employee
+  did not say which leave, call get_leave_balance and ask them to pick one of
+  the upcoming leaves it lists. There is no tool to cancel a WFH request:
+  never use cancel_leave for one - tell the employee to cancel it in the HRMS.
+- Once you have the dates, call apply_leave / apply_wfh / cancel_leave
+  straight away. Do not ask the employee to confirm in chat: calling the tool
+  shows them the details and asks for confirmation itself. If the tool says they declined, do not
+  retry it.
+- Team feedback: get_feedback_requests lists the employee's feedback
+  requests. For the colleagues and sections of a form, call get_feedback_form;
+  to download it as a CSV file, call save_feedback_form. Both take the
+  request's project or form name, or nothing when there is only one - never
+  an id. Call them straight away: never offer to fetch the form or ask
+  whether to proceed. Report the saved file's path exactly as returned.
+- To upload or submit a filled-in feedback form, call list_feedback_files and
+  ask the employee which file to upload, listing the names it returns. Once
+  they pick one, call submit_feedback_form with that file name exactly as
+  listed - never invent a file name. Do not ask them to confirm in chat:
+  submit_feedback_form asks for confirmation itself.
+- Never say "let me check" or "I will retrieve" - if you need a tool, call it
+  in this turn.
+"""
+AGENT_NO_LOGIN_PROMPT = """- The employee is NOT logged in to the HRMS yet. Before any other HRMS tool -
+  applying for leave or WFH, balances, history, holidays, team, their record -
+  call the login tool. It asks them for their email and password; once
+  it succeeds, carry on with what they asked. Policy questions need no login.
+"""
+
+# The agent's version of KNOWLEDGE_PROMPT. That one calls the notes authoritative
+# "even when the context below says nothing", which in chat sits above the
+# retrieved policy. In the agent nothing follows it, so a model reading a leave
+# question checked these notes, found no encashment, and said it did not know.
+AGENT_KNOWLEDGE_PROMPT = """
+
+Reference notes: formulas, definitions and which source wins. They are NOT the
+policy and cover only a few topics - a term missing from them says nothing
+about whether the policy covers it. Use a formula exactly as written, showing
+the substituted numbers.
+
+{knowledge}"""
+
+# Put in front of the employee's question with whatever the policy search found.
+AGENT_EXCERPTS_PROMPT = """Policy excerpts found for this question (search_policy has already run):
+
+{excerpts}
+
+Answer from these when the question is about what the policy says. Call
+search_policy again only for a different topic they do not cover. They are
+background only: when the employee asks you to do something - apply for leave
+or WFH, check a balance or their history - use the HRMS tools for it.
+
+Question: {question}"""
+
+# The agent's profile section. Not PROFILE_PROMPT: that one tells the model the
+# policy is already "in the context above", which in agent mode it is not - and
+# the model then answers policy questions without ever calling search_policy.
+AGENT_PROFILE_PROMPT = """
+
+The employee you are talking to, as of today's HRMS data:
+
+{profile}
+
+Use these details for questions about them. For what the policy says, still
+call search_policy."""
 
 
 SPLIT_PROMPT = """Split the question into the separate questions it literally contains.

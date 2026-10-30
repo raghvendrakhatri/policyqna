@@ -1,4 +1,4 @@
-"""Entry point for `python -m rag` and `python -m app.rag`."""
+"""Kept so `python -m app.rag` still works; the entry point is app/main.py."""
 
 import sys
 

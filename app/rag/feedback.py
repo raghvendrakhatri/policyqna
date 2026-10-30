@@ -50,8 +50,10 @@ Ground rules (all of them, not just the first one you notice):
 - Refer to the colleague as '{pronoun}' (never the name; the name is already
   above every column).
 - Keep it plain and direct. No preamble, no praise sandwich, no closing line.
-- A sub-category the note doesn't touch gets a short line consistent with the
-  score - one clause, not a paragraph. Score 5 = exceptional, 4 = strong,
+- Each sub-category remark must be a complete, proper sentence (subject +
+  verb, ending with a period) - not a fragment, clause, or bullet phrase.
+- A sub-category the note doesn't touch still gets a complete sentence
+  consistent with the score. Score 5 = exceptional, 4 = strong,
   3 = solid/expected, 2 = inconsistent, 1 = a real gap.
 
 Output format (exactly this, nothing else):
@@ -60,9 +62,9 @@ Output format (exactly this, nothing else):
 <one or two sentences summarising the section>
 
 [Sub-category Remarks]
-- <sub-category>: <one line>
-- <sub-category>: <one line>
-...one line per sub-category listed below, in order...
+- <sub-category>: <one complete sentence ending with a period>
+- <sub-category>: <one complete sentence ending with a period>
+...one sentence per sub-category listed below, in order...
 
 Colleague: {name}
 Section: {section} (score {score}/5)
@@ -104,7 +106,10 @@ def parse_csv(path: str) -> tuple[list[list[str]], list[str], list[dict]]:
             last_subcat = None
         if current is None:
             continue
-        if kind.lower() == "score":
+        # The kind column is the score field's label, and a form may label it
+        # after the aspect ("Timeliness") rather than "Score".
+        if kind.lower() == "score" or (subcat and subcat != SECTION_REMARKS
+                                       and kind and kind.lower() != "remarks"):
             last_subcat = {"name": subcat, "score_row": i, "remarks_row": None}
             current["subcats"].append(last_subcat)
         elif kind.lower() == "remarks" and last_subcat is not None:
@@ -373,15 +378,18 @@ def ask_shared_inputs(names: list[str], scored: list[dict]) -> dict | None:
     }
 
 
-def build_answers(name: str, shared: dict, sections: list[dict], model) -> dict:
+def build_answers(name: str, shared: dict, sections: list[dict], model,
+                  pronoun: str | None = None) -> dict:
     """Per person, per section: {"score", "section_remark", "subcat_remarks"}.
 
     Kudos, when set, comes back under the KUDOS section with only "remark".
+    `pronoun` is the reviewer's choice; without one it is inferred.
     """
     result: dict = {}
     note = shared["note"]
-    pronoun = infer_pronoun(model, name)
-    err_console.print(f"[dim]· {name.split()[0]} → {pronoun}[/dim]")
+    if pronoun not in PRONOUNS:
+        pronoun = infer_pronoun(model, name)
+        err_console.print(f"[dim]· {name.split()[0]} → {pronoun}[/dim]")
     scores = shared["scores"]
     for section in sections:
         if section["name"] == KUDOS:

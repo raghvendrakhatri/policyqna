@@ -9,13 +9,13 @@ the index. No API keys, no network calls off the machine.
   store  - langchain_postgres.PGVector, which owns its own schema
            (langchain_pg_collection / langchain_pg_embedding)
 
-Commands: ingest | ask | chat | discover | profile | pa | stats | reset
+Commands: check | ingest | ask | chat | discover | profile | pa | stats | reset
 
 Answers draw on three things: knowledge/ (in every prompt), the pgvector
 index (retrieved per question), and the HRMS (fetched per session).
 
 The pipeline is spread across sibling modules; this file re-exports the
-symbols the tests and app/main.py reach in via `import rag`.
+symbols the tests reach in via `import rag`.
 """
 
 from dotenv import load_dotenv

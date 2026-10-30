@@ -1,70 +1,27 @@
-"""Health check: can we reach Postgres and Ollama? The app itself is rag.py."""
+"""Entry point: `uv run python app/main.py <command>`. See `--help`.
 
-import os
+Runs the health check first (Postgres, Ollama, models) and only hands over to
+the CLI once it passes.
+"""
+
 import sys
-import urllib.error
-import urllib.request
 
-import psycopg
-from dotenv import load_dotenv
+try:
+    from .rag.cli import cmd_check, main  # python -m app
+except ImportError:
+    from rag.cli import cmd_check, main  # python app/main.py
 
-import rag
-
-
-def ping_database() -> str:
-    with psycopg.connect(
-        dbname=os.getenv("POSTGRES_DB"),
-        user=os.getenv("POSTGRES_USER"),
-        password=os.getenv("POSTGRES_PASSWORD"),
-        host=os.getenv("POSTGRES_HOST", "localhost"),
-        port=os.getenv("POSTGRES_PORT"),
-        connect_timeout=5,
-    ) as conn:
-        with conn.cursor() as cur:
-            cur.execute("SELECT version()")
-            return cur.fetchone()[0]
+# `check` is the health check itself, and help needs neither service up.
+SKIP_CHECK = {"check", "-h", "--help"}
 
 
-def ping_ollama(base_url: str) -> list[str]:
-    with urllib.request.urlopen(f"{base_url}/api/tags", timeout=5) as response:
-        import json
-
-        return [m["name"] for m in json.load(response).get("models", [])]
-
-
-def main():
-    load_dotenv()
-
-    missing = [name for name in rag.REQUIRED_ENV if not os.getenv(name)]
-    if missing:
-        print(
-            f"Missing env vars: {', '.join(missing)}. Copy .env.example to .env.",
-            file=sys.stderr,
-        )
-        return 1
-
-    try:
-        version = ping_database()
-    except psycopg.Error as exc:
-        print(f"Database ping failed: {exc}", file=sys.stderr)
-        return 1
-    print(f"Database OK: {version}")
-
-    base_url = os.getenv("OLLAMA_BASE_URL")
-    try:
-        models = ping_ollama(base_url)
-    except (urllib.error.URLError, OSError) as exc:
-        print(f"Ollama ping failed at {base_url}: {exc}", file=sys.stderr)
-        return 1
-    print(f"Ollama OK at {base_url}: {len(models)} model(s) available")
-
-    for var in ("CHAT_MODEL", "EMBED_MODEL"):
-        name = os.getenv(var)
-        if name and name not in models:
-            print(f"Warning: {var}={name} is not pulled. `ollama pull {name}`", file=sys.stderr)
-
-    return 0
+def run() -> int:
+    if not SKIP_CHECK & set(sys.argv[1:2]):
+        status = cmd_check()
+        if status:
+            return status
+    return main()
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run())

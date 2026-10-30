@@ -10,7 +10,7 @@ import sys
 
 from langchain_ollama import ChatOllama
 
-from .config import KEEP_ALIVE, env
+from .config import KEEP_ALIVE, ROUTE_PROMPT, TOPICALITY_PROMPT, env
 
 
 # Prompt-injection patterns. A user question should never try to reset the
@@ -27,6 +27,11 @@ INJECTION = re.compile(
 )
 MAX_QUESTION_CHARS = 2000
 REFUSAL = "I can only answer questions about the indexed policy documents."
+OFF_TOPIC_REFUSAL = (
+    "That question is outside the scope of our policy documents and your HRMS"
+    " record. I can only help with company policy, benefits, leave, WFH,"
+    " reimbursement, performance, or your own HRMS details."
+)
 UNSAFE_REFUSAL = "That request was flagged as unsafe and won't be answered."
 UNSAFE_OUTPUT = "The generated answer was flagged as unsafe and has been suppressed."
 
@@ -42,6 +47,13 @@ STRAY_CLOSE = re.compile(r"^.*?</(reasoning|analysis|think|thinking)>", re.S | r
 # Set SAFETY_MODEL=llama-guard3:1b in .env to enable; unset to skip. The 1B
 # variant is small enough to run per call without evicting the chat model.
 _safety_llm: "ChatOllama | None" = None
+# Categories that are not a harm here. S6 is "specialized advice" - financial,
+# medical, legal - and a policy answer about leave encashment or reimbursement
+# is exactly that by design; llama-guard suppressed such answers outright.
+SAFETY_IGNORE = {
+    c.strip().lower()
+    for c in os.getenv("SAFETY_IGNORE", "s6").split(",") if c.strip()
+}
 
 
 def safety_llm() -> "ChatOllama | None":
@@ -77,7 +89,83 @@ def check_safety(text: str, role: str) -> str | None:
     if verdict.startswith("safe"):
         return None
     lines = verdict.splitlines()
-    return lines[1].strip() if len(lines) > 1 else "unsafe"
+    if len(lines) < 2:
+        return "unsafe"
+    flagged = [c.strip() for c in lines[1].split(",") if c.strip()]
+    real = [c for c in flagged if c not in SAFETY_IGNORE]
+    return ",".join(real) if real else None
+
+
+# Topicality classifier: a cheap yes/no on the chat model to catch off-topic
+# questions ("capital of France", "write me Python") that neither the injection
+# regex nor LlamaGuard reject. The chat model is already resident, so this is
+# one extra forward pass of a few tokens. Opt-out with TOPICALITY_CHECK=0.
+_topicality_llm: "ChatOllama | None" = None
+
+
+def topicality_llm() -> "ChatOllama":
+    global _topicality_llm
+    if _topicality_llm is None:
+        _topicality_llm = ChatOllama(
+            model=env("CHAT_MODEL"),
+            base_url=env("OLLAMA_BASE_URL"),
+            temperature=0,
+            keep_alive=KEEP_ALIVE,
+            num_predict=4,  # "yes" / "no" and nothing more
+            # On a thinking model (qwen3) the thinking eats all four tokens and
+            # the reply comes back empty, which read as "no" to every question.
+            reasoning=False,
+        )
+    return _topicality_llm
+
+
+def check_topicality(question: str) -> bool:
+    """True when the question is in scope for a policy/HRMS assistant.
+
+    Fails open: a classifier error must not block a legitimate question.
+    """
+    if os.getenv("TOPICALITY_CHECK", "1").lower() in ("0", "false", "no", "off"):
+        return True
+    try:
+        verdict = topicality_llm().invoke(
+            [("system", TOPICALITY_PROMPT), ("human", question)]
+        ).content.strip().lower()
+    except Exception as exc:  # noqa: BLE001 - a classifier failure must not block
+        print(f"Topicality check skipped: {exc}", file=sys.stderr)
+        return True
+    verdict = clean(verdict)
+    return verdict.startswith("yes")
+
+
+ROUTES = ("policy", "hrms", "no")
+
+
+def parse_route(verdict: str) -> str:
+    """The route a classifier reply names, or "policy" when it names none:
+    searching the policy needlessly costs less than missing it."""
+    word = clean(verdict).strip().lower().lstrip("*'\"` ")
+    return next((r for r in ROUTES if word.startswith(r)), "policy")
+
+
+def route_question(question: str) -> str:
+    """"policy" when the question needs the policy searched, "hrms" when it
+    needs only the HRMS tools, "no" when it is out of scope.
+
+    Fails open to "policy", which is what every question got before routing.
+    TOPICALITY_CHECK=0 turns "no" into "policy" rather than skipping the call:
+    the route still decides the search.
+    """
+    try:
+        verdict = topicality_llm().invoke(
+            [("system", ROUTE_PROMPT), ("human", question)]
+        ).content
+    except Exception as exc:  # noqa: BLE001 - a classifier failure must not block
+        print(f"Question routing skipped: {exc}", file=sys.stderr)
+        return "policy"
+    route = parse_route(verdict)
+    if route == "no" and os.getenv("TOPICALITY_CHECK", "1").lower() in ("0", "false", "no", "off"):
+        return "policy"
+    return route
 
 
 def guard_input(question: str) -> str | None:
